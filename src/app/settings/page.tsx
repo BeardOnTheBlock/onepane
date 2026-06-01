@@ -9,7 +9,7 @@ import { AccountRow } from "@/components/settings/account-row";
 import { ConnectAccountCard } from "@/components/settings/connect-account-card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAccounts } from "@/hooks/use-accounts";
-import { useProviders } from "@/hooks/use-providers";
+import { useProviderCredentials } from "@/hooks/use-provider-credentials";
 
 /**
  * Reads ?connected / ?error params once on mount, surfaces a toast, refreshes
@@ -91,7 +91,11 @@ function LoadErrorState({ message }: { message: string }) {
 
 export default function SettingsPage() {
   const { accounts, isLoading, error, mutate } = useAccounts();
-  const { providers, isLoading: providersLoading } = useProviders();
+  const {
+    statuses,
+    isLoading: credsLoading,
+    mutate: mutateCreds,
+  } = useProviderCredentials();
 
   const refreshAccounts = React.useCallback(() => {
     void mutate();
@@ -120,19 +124,22 @@ export default function SettingsPage() {
             Connect an account
           </h2>
           <p className="mb-4 text-sm text-muted-foreground">
-            Start the OAuth consent flow for a provider. Tokens are stored
-            encrypted on this machine only.
+            Add each provider&rsquo;s OAuth Client ID &amp; Secret (stored
+            encrypted on this machine), then run the consent flow. Tokens are
+            stored encrypted here only.
           </p>
           <div className="grid gap-4 sm:grid-cols-2">
             <ConnectAccountCard
               provider="google"
-              configured={providers.google}
-              isLoading={providersLoading}
+              status={statuses?.google}
+              isLoading={credsLoading}
+              onChanged={mutateCreds}
             />
             <ConnectAccountCard
               provider="microsoft"
-              configured={providers.microsoft}
-              isLoading={providersLoading}
+              status={statuses?.microsoft}
+              isLoading={credsLoading}
+              onChanged={mutateCreds}
             />
           </div>
         </section>

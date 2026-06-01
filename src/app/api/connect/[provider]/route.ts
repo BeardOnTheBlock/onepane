@@ -8,14 +8,16 @@ import { randomBytes } from "node:crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
-import { ALL_PROVIDERS, isProviderConfigured } from "@/lib/config";
+import {
+  ALL_PROVIDERS,
+  isProviderConfigured,
+  OAUTH_STATE_COOKIE,
+} from "@/lib/config";
 import { buildAuthUrl } from "@/lib/oauth";
 import type { ProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-export const OAUTH_STATE_COOKIE = "onepane_oauth_state";
 
 function isProviderId(value: string): value is ProviderId {
   return (ALL_PROVIDERS as string[]).includes(value);
@@ -39,9 +41,9 @@ export async function GET(
     return settingsRedirect(req, { error: `Unknown provider: ${provider}` });
   }
 
-  if (!isProviderConfigured(provider)) {
+  if (!(await isProviderConfigured(provider))) {
     return settingsRedirect(req, {
-      error: `${provider} is not configured. See docs/OAUTH_SETUP.md.`,
+      error: `${provider} is not configured. Add its Client ID and Secret in Settings.`,
     });
   }
 
@@ -57,7 +59,7 @@ export async function GET(
       secure: process.env.NODE_ENV === "production",
     });
 
-    return NextResponse.redirect(buildAuthUrl(provider, state));
+    return NextResponse.redirect(await buildAuthUrl(provider, state));
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to start sign-in.";
     return settingsRedirect(req, { error: message });

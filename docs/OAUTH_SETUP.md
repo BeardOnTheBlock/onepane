@@ -1,14 +1,22 @@
 # OAuth setup
 
 OnePane connects to your accounts using OAuth 2.0. You create your own OAuth credentials
-with Google and/or Microsoft, paste them into `.env`, and OnePane uses them to run the
-consent flow locally. Because the credentials are yours, no third party ever sees your
-tokens — they are stored, encrypted, only on your machine.
+with Google and/or Microsoft, and OnePane uses them to run the consent flow locally.
+Because the credentials are yours, no third party ever sees your tokens — they are stored,
+encrypted, only on your machine.
 
-You only need to set up the provider(s) you actually want to use. OnePane shows a
-"Connect" button for a provider only when its credentials are present in `.env`.
+**Two ways to provide the Client ID & Secret** (pick one):
 
-After editing `.env`, restart `npm run dev` so the new values are picked up.
+- **In the app (recommended).** Run OnePane, open **Settings → Set up Google/Microsoft**, and
+  paste the Client ID & Secret there. They are stored **encrypted in the local database** —
+  never in a file or the repo. No restart needed.
+- **In `.env`.** Set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` (and/or the Microsoft pair),
+  then restart `npm run dev`. The `.env` file is git-ignored.
+
+You only need to set up the provider(s) you actually want to use. OnePane shows a working
+"Connect" button for a provider once its credentials are present (from either source).
+
+The steps below cover creating the credentials; where they go is your choice above.
 
 - [Google](#google-gmail--google-calendar--google-meet)
 - [Microsoft](#microsoft-outlook-mail--calendar--teams)
@@ -57,7 +65,7 @@ In the selected project, enable both APIs (APIs & Services → Library, search a
 3. Under **Authorized redirect URIs**, add exactly:
 
    ```
-   http://localhost:3000/api/connect/google/callback
+   http://localhost:6969/api/connect/google/callback
    ```
 
 4. Click **Create**. Copy the **Client ID** and **Client secret**.
@@ -91,7 +99,7 @@ that **both** work/school **and** personal Microsoft accounts can connect.
 5. **Redirect URI:** select platform type **Web** and enter exactly:
 
    ```
-   http://localhost:3000/api/connect/microsoft/callback
+   http://localhost:6969/api/connect/microsoft/callback
    ```
 
 6. Click **Register**. On the overview page, copy the **Application (client) ID**.
@@ -142,8 +150,8 @@ calendar, and physical-location invites, just not Teams.
 The redirect URI registered with the provider must match what OnePane sends, **character for
 character**. Confirm the registered URI is exactly one of:
 
-- `http://localhost:3000/api/connect/google/callback`
-- `http://localhost:3000/api/connect/microsoft/callback`
+- `http://localhost:6969/api/connect/google/callback`
+- `http://localhost:6969/api/connect/microsoft/callback`
 
 Common mistakes: a trailing slash, `https` instead of `http` for localhost, a different
 port, or registering the app's home page instead of the `.../callback` path. If you run

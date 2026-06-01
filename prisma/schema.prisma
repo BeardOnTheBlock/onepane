@@ -37,3 +37,15 @@ model Account {
   // A provider+email pair is unique so re-connecting updates the same row.
   @@unique([provider, email])
 }
+
+// OAuth *client* credentials for a provider (the Client ID + Secret you create
+// in Google Cloud / Microsoft Entra). Stored here — encrypted at rest, just like
+// account tokens — so they live in the local database instead of a .env file.
+// One row per provider.
+model ProviderCredential {
+  provider     String   @id // "google" | "microsoft"
+  clientId     String // encrypted (AES-256-GCM)
+  clientSecret String // encrypted (AES-256-GCM)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

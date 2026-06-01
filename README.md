@@ -96,11 +96,6 @@ Generate an encryption key and paste it into `ONEPANE_ENCRYPTION_KEY` in `.env`:
 openssl rand -base64 32
 ```
 
-Set up Google and/or Microsoft OAuth credentials and fill in the matching values in
-`.env`. The full, click-by-click walkthrough for both providers lives in
-[`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). You can connect just one provider to start —
-the UI only shows a "Connect" button for providers whose credentials are present.
-
 Initialise the local database, then start the dev server:
 
 ```bash
@@ -108,11 +103,16 @@ Initialise the local database, then start the dev server:
 npm run setup     # runs `prisma generate && prisma db push`
 
 # 4. Run it
-npm run dev       # http://localhost:3000
+npm run dev       # http://localhost:6969
 ```
 
-Open <http://localhost:3000>, go to **Settings**, and connect your accounts. Each one runs
-through the provider's consent screen and lands back in OnePane ready to use.
+Open <http://localhost:6969> and go to **Settings**. For each provider you want, create
+your own OAuth credentials (one-time, free — the click-by-click walkthrough for Google and
+Microsoft is in [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md)) and paste the **Client ID &
+Secret** straight into the **Set up Google/Microsoft** card. They're stored encrypted in the
+local database — no `.env` editing required (though you can use `.env` instead if you
+prefer). Then hit **Connect**, complete the consent screen, and you're in. You can connect
+just one provider to start, and as many accounts as you like.
 
 ## Conferencing and locations
 

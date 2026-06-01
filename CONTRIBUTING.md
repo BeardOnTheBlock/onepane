@@ -25,7 +25,7 @@ Initialise the database and start the dev server:
 
 ```bash
 npm run setup     # prisma generate && prisma db push
-npm run dev       # http://localhost:3000
+npm run dev       # http://localhost:6969
 ```
 
 Useful scripts (all defined in `package.json`):

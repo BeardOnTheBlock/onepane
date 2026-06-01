@@ -8,10 +8,9 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(): Promise<Response> {
-  return Response.json({
-    providers: {
-      google: isProviderConfigured("google"),
-      microsoft: isProviderConfigured("microsoft"),
-    },
-  });
+  const [google, microsoft] = await Promise.all([
+    isProviderConfigured("google"),
+    isProviderConfigured("microsoft"),
+  ]);
+  return Response.json({ providers: { google, microsoft } });
 }

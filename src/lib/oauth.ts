@@ -36,8 +36,11 @@ export interface ConnectedProfile {
 }
 
 /** Builds the provider consent URL the user is redirected to. */
-export function buildAuthUrl(provider: ProviderId, state: string): string {
-  const cfg = getProviderConfig(provider);
+export async function buildAuthUrl(
+  provider: ProviderId,
+  state: string,
+): Promise<string> {
+  const cfg = await getProviderConfig(provider);
   const params = new URLSearchParams({
     client_id: cfg.clientId,
     redirect_uri: cfg.redirectUri,
@@ -65,7 +68,7 @@ export async function exchangeCodeForTokens(
   provider: ProviderId,
   code: string,
 ): Promise<ExchangedTokens> {
-  const cfg = getProviderConfig(provider);
+  const cfg = await getProviderConfig(provider);
   const body = new URLSearchParams({
     client_id: cfg.clientId,
     client_secret: cfg.clientSecret,
@@ -166,7 +169,7 @@ async function refreshAccessToken(
   provider: ProviderId,
   refreshToken: string,
 ): Promise<ExchangedTokens> {
-  const cfg = getProviderConfig(provider);
+  const cfg = await getProviderConfig(provider);
   const body = new URLSearchParams({
     client_id: cfg.clientId,
     client_secret: cfg.clientSecret,

@@ -6,9 +6,9 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 6969",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 6969",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "setup": "prisma generate && prisma db push",

@@ -8,11 +8,9 @@ import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 import { upsertAccount } from "@/lib/accounts";
-import { ALL_PROVIDERS } from "@/lib/config";
+import { ALL_PROVIDERS, OAUTH_STATE_COOKIE } from "@/lib/config";
 import { exchangeCodeForTokens, fetchProfile } from "@/lib/oauth";
 import type { ProviderId } from "@/lib/types";
-
-import { OAUTH_STATE_COOKIE } from "../route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
