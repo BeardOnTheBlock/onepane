@@ -57,6 +57,19 @@ export interface UnifiedMessage {
   hasAttachments: boolean;
 }
 
+/** Metadata for an attachment on a received message. */
+export interface AttachmentMeta {
+  /** Provider attachment id, used to download the bytes. */
+  id: string;
+  filename: string;
+  mimeType: string;
+  /** Size in bytes (0 when the provider doesn't report it). */
+  size: number;
+  /** True for attachments referenced inline in the HTML body (cid:), which we
+   *  hide from the attachment list since they render inside the message. */
+  inline: boolean;
+}
+
 /** A fully-loaded message (body + headers needed to thread replies). */
 export interface UnifiedMessageFull extends UnifiedMessage {
   cc: MailAddress[];
@@ -66,6 +79,24 @@ export interface UnifiedMessageFull extends UnifiedMessage {
   messageIdHeader: string | null;
   /** Existing References header, if any. */
   references: string | null;
+  /** Downloadable (non-inline) attachments on this message. */
+  attachments: AttachmentMeta[];
+}
+
+/** A file to attach to an outgoing message. */
+export interface OutgoingAttachment {
+  filename: string;
+  mimeType: string;
+  /** Standard base64 (not base64url) of the raw file bytes. */
+  contentBase64: string;
+}
+
+/** A downloaded attachment's bytes, returned by the provider for streaming. */
+export interface DownloadedAttachment {
+  filename: string;
+  mimeType: string;
+  /** Standard base64 of the raw file bytes. */
+  contentBase64: string;
 }
 
 /** A new outgoing message. */
@@ -75,6 +106,7 @@ export interface MailDraft {
   subject: string;
   bodyText: string;
   bodyHtml?: string;
+  attachments?: OutgoingAttachment[];
 }
 
 /** Threading context supplied when a draft is a reply to an existing message. */
@@ -154,14 +186,28 @@ export interface DateRange {
 }
 
 export interface MailProvider {
+  /** Lists inbox messages. When `query` is provided, performs a full-text
+   *  search across the mailbox instead of listing the inbox. */
   listMessages(
     account: AccountWithTokens,
     limit: number,
+    query?: string,
   ): Promise<UnifiedMessage[]>;
   getMessage(
     account: AccountWithTokens,
     messageId: string,
   ): Promise<UnifiedMessageFull>;
+  /** Returns every message in a conversation/thread, oldest first. */
+  getThread(
+    account: AccountWithTokens,
+    threadId: string,
+  ): Promise<UnifiedMessageFull[]>;
+  /** Downloads the bytes of a single attachment. */
+  getAttachment(
+    account: AccountWithTokens,
+    messageId: string,
+    attachmentId: string,
+  ): Promise<DownloadedAttachment>;
   sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
@@ -203,6 +249,11 @@ export interface MailListResponse {
 
 export interface MailMessageResponse {
   message: UnifiedMessageFull;
+}
+
+export interface MailThreadResponse {
+  /** Every message in the conversation, oldest first. */
+  messages: UnifiedMessageFull[];
 }
 
 export interface CalendarListResponse {

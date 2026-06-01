@@ -2,31 +2,38 @@
 
 import * as React from "react";
 import useSWR from "swr";
-import { AlertCircle, MailOpen, Paperclip, Reply } from "lucide-react";
+import { AlertCircle, MailOpen, Reply } from "lucide-react";
 
 import { AccountBadge } from "@/components/account-badge";
 import { EmptyState } from "@/components/empty-state";
+import { ThreadMessage } from "@/components/inbox/thread-message";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { accountById } from "@/hooks/use-accounts";
 import { fetcher } from "@/lib/fetcher";
-import { formatAddress } from "@/lib/utils";
 import type {
   AccountPublic,
   MailMessageResponse,
+  MailThreadResponse,
   UnifiedMessageFull,
 } from "@/lib/types";
 import type { ComposePrefill } from "@/components/inbox/compose-dialog";
 
+/** The conversation the reader is showing: account + thread + representative msg. */
+export interface ReaderSelection {
+  accountId: string;
+  threadId: string | null;
+  messageId: string;
+}
+
 export interface MailReaderProps {
-  /** The selected list message's account + id, or null for the empty state. */
-  selected: { accountId: string; id: string } | null;
+  selected: ReaderSelection | null;
   accounts: AccountPublic[];
   onReply: (prefill: ComposePrefill) => void;
 }
 
-/** Build the reply pre-fill from a fully-loaded message. */
+/** Build the reply pre-fill from a fully-loaded message (the latest in a thread). */
 function buildReplyPrefill(m: UnifiedMessageFull): ComposePrefill {
   const subject = /^re:/i.test(m.subject.trim())
     ? m.subject
@@ -44,32 +51,68 @@ function buildReplyPrefill(m: UnifiedMessageFull): ComposePrefill {
   };
 }
 
-function AddressList({
-  label,
-  addresses,
-}: {
-  label: string;
-  addresses: { name?: string; email: string }[];
-}) {
-  if (addresses.length === 0) return null;
-  return (
-    <div className="flex gap-2 text-sm">
-      <span className="w-12 shrink-0 text-muted-foreground">{label}</span>
-      <span className="min-w-0 break-words text-foreground/90">
-        {addresses.map((a) => formatAddress(a)).join(", ")}
-      </span>
-    </div>
-  );
+/** SWR key for the conversation: the thread when threaded, else the single message. */
+function readerKey(selected: ReaderSelection | null): string | null {
+  if (!selected) return null;
+  if (selected.threadId) {
+    return `/api/mail/thread?accountId=${encodeURIComponent(
+      selected.accountId,
+    )}&threadId=${encodeURIComponent(selected.threadId)}`;
+  }
+  return `/api/mail/message?accountId=${encodeURIComponent(
+    selected.accountId,
+  )}&id=${encodeURIComponent(selected.messageId)}`;
+}
+
+/** Normalises either endpoint's payload into a list of messages, oldest first. */
+function messagesFrom(
+  selected: ReaderSelection,
+  data: MailThreadResponse | MailMessageResponse | undefined,
+): UnifiedMessageFull[] {
+  if (!data) return [];
+  if (selected.threadId) {
+    return (data as MailThreadResponse).messages ?? [];
+  }
+  const single = (data as MailMessageResponse).message;
+  return single ? [single] : [];
 }
 
 export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
-  const key = selected
-    ? `/api/mail/message?accountId=${encodeURIComponent(
-        selected.accountId,
-      )}&id=${encodeURIComponent(selected.id)}`
-    : null;
+  const key = readerKey(selected);
 
-  const { data, error, isLoading } = useSWR<MailMessageResponse>(key, fetcher);
+  const { data, error, isLoading } = useSWR<
+    MailThreadResponse | MailMessageResponse
+  >(key, fetcher);
+
+  const messages = React.useMemo(
+    () => (selected ? messagesFrom(selected, data) : []),
+    [selected, data],
+  );
+
+  // Track which message cards are expanded. We default to the latest expanded,
+  // re-deriving whenever the conversation changes (keyed on its message ids).
+  const idSignature = messages.map((m) => m.id).join("|");
+  const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    if (messages.length === 0) {
+      setExpanded(new Set());
+      return;
+    }
+    const latest = messages[messages.length - 1];
+    setExpanded(new Set([latest.id]));
+    // Re-run only when the conversation's identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idSignature]);
+
+  const toggle = React.useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   if (!selected) {
     return (
@@ -85,51 +128,45 @@ export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
     return (
       <EmptyState
         icon={AlertCircle}
-        title="Couldn't load this message"
+        title="Couldn't load this conversation"
         description={error instanceof Error ? error.message : undefined}
       />
     );
   }
 
-  if (isLoading || !data) {
+  if (isLoading || messages.length === 0) {
     return (
       <div className="flex h-full flex-col">
         <div className="space-y-3 border-b border-border p-5">
           <Skeleton className="h-6 w-2/3" />
-          <Skeleton className="h-4 w-1/2" />
           <Skeleton className="h-4 w-1/3" />
         </div>
         <div className="space-y-3 p-5">
-          <Skeleton className="h-4 w-full" />
-          <Skeleton className="h-4 w-11/12" />
-          <Skeleton className="h-4 w-4/5" />
-          <Skeleton className="h-4 w-3/4" />
+          <Skeleton className="h-16 w-full rounded-lg" />
+          <Skeleton className="h-40 w-full rounded-lg" />
         </div>
       </div>
     );
   }
 
-  const m = data.message;
-  const account = accountById(accounts, m.accountId);
-  const dateLabel = (() => {
-    const d = new Date(m.date);
-    return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
-  })();
+  const latest = messages[messages.length - 1];
+  const account = accountById(accounts, selected.accountId);
+  const subject = latest.subject || "(no subject)";
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
+      {/* Conversation header */}
       <div className="shrink-0 border-b border-border p-5">
         <div className="flex items-start justify-between gap-4">
           <h2 className="min-w-0 break-words text-lg font-semibold leading-snug text-foreground">
-            {m.subject || "(no subject)"}
+            {subject}
           </h2>
           <Button
             type="button"
             size="sm"
             variant="outline"
             className="shrink-0"
-            onClick={() => onReply(buildReplyPrefill(m))}
+            onClick={() => onReply(buildReplyPrefill(latest))}
           >
             <Reply aria-hidden="true" />
             Reply
@@ -143,69 +180,28 @@ export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
               className="rounded-full bg-secondary px-2.5 py-0.5"
             />
           ) : null}
-          {dateLabel ? (
-            <time
-              dateTime={m.date}
-              className="text-xs text-muted-foreground"
-            >
-              {dateLabel}
-            </time>
-          ) : null}
-          {m.hasAttachments ? (
-            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-              <Paperclip className="h-3.5 w-3.5" aria-hidden="true" />
-              Attachments
+          {messages.length > 1 ? (
+            <span className="text-xs text-muted-foreground">
+              {messages.length} messages
             </span>
           ) : null}
         </div>
+      </div>
 
-        <div className="mt-3 space-y-1">
-          <AddressList label="From" addresses={[m.from]} />
-          <AddressList label="To" addresses={m.to} />
-          <AddressList label="Cc" addresses={m.cc} />
+      {/* Conversation thread */}
+      <ScrollArea className="min-h-0 flex-1 scrollbar-thin">
+        <div className="flex flex-col gap-2.5 p-4">
+          {messages.map((message) => (
+            <ThreadMessage
+              key={message.id}
+              message={message}
+              account={accountById(accounts, message.accountId) ?? account}
+              expanded={expanded.has(message.id)}
+              onToggle={() => toggle(message.id)}
+            />
+          ))}
         </div>
-      </div>
-
-      {/* Body */}
-      <div className="min-h-0 flex-1">
-        <MessageBody message={m} />
-      </div>
-    </div>
-  );
-}
-
-/**
- * Renders the message body. HTML is isolated inside a fully sandboxed iframe
- * (empty `sandbox` attribute → no scripts, no same-origin, no top navigation),
- * so remote content can't run or read the app. Plain text is shown pre-wrapped.
- */
-function MessageBody({ message }: { message: UnifiedMessageFull }) {
-  if (message.bodyHtml) {
-    return (
-      <iframe
-        title="Message content"
-        sandbox=""
-        srcDoc={message.bodyHtml}
-        className="h-full w-full border-0 bg-white"
-      />
-    );
-  }
-
-  if (message.bodyText) {
-    return (
-      <ScrollArea className="h-full scrollbar-thin">
-        <pre className="whitespace-pre-wrap break-words p-5 font-sans text-sm leading-relaxed text-foreground/90">
-          {message.bodyText}
-        </pre>
       </ScrollArea>
-    );
-  }
-
-  return (
-    <EmptyState
-      icon={MailOpen}
-      title="No content"
-      description="This message has no body to display."
-    />
+    </div>
   );
 }

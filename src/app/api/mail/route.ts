@@ -1,7 +1,8 @@
-// GET /api/mail?accountId=all|ID&limit=25
+// GET /api/mail?accountId=all|ID&limit=25&q=search
 // Aggregated unified inbox. Fetches the latest messages from one account or all
 // connected accounts in parallel. A failure on one account is collected into
-// `errors` and never blanks out the rest of the view.
+// `errors` and never blanks out the rest of the view. When `q` is provided it
+// performs a full-text search across each mailbox instead of listing the inbox.
 
 import {
   getAccountWithTokens,
@@ -33,6 +34,8 @@ export async function GET(req: Request): Promise<Response> {
   const { searchParams } = new URL(req.url);
   const accountId = searchParams.get("accountId") ?? "all";
   const limit = clampLimit(searchParams.get("limit"));
+  const rawQuery = searchParams.get("q")?.trim();
+  const query = rawQuery && rawQuery.length ? rawQuery : undefined;
 
   // Resolve the set of accounts to query.
   let accounts: AccountWithTokens[];
@@ -59,6 +62,7 @@ export async function GET(req: Request): Promise<Response> {
         return await getMailProvider(account.provider).listMessages(
           account,
           limit,
+          query,
         );
       } catch (err) {
         errors.push({

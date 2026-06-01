@@ -14,8 +14,13 @@ import {
   ComposeDialog,
   type ComposePrefill,
 } from "@/components/inbox/compose-dialog";
+import {
+  groupConversations,
+  type Conversation,
+} from "@/components/inbox/conversations";
 import { MailList } from "@/components/inbox/mail-list";
-import { MailReader } from "@/components/inbox/mail-reader";
+import { MailReader, type ReaderSelection } from "@/components/inbox/mail-reader";
+import { SearchInput } from "@/components/inbox/search-input";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -25,29 +30,40 @@ import { cn } from "@/lib/utils";
 import type { AccountError, MailListResponse, UnifiedMessage } from "@/lib/types";
 
 const PAGE_SIZE = 25;
+const SEARCH_DEBOUNCE_MS = 350;
 
-/** Stable key for the message list given the current account filter. */
-function mailKey(accountId: string): string {
-  return `/api/mail?accountId=${encodeURIComponent(
+/** Stable key for the message list given the account filter and search term. */
+function mailKey(accountId: string, query: string): string {
+  const base = `/api/mail?accountId=${encodeURIComponent(
     accountId,
   )}&limit=${PAGE_SIZE}`;
+  const q = query.trim();
+  return q ? `${base}&q=${encodeURIComponent(q)}` : base;
 }
 
 export default function InboxPage() {
   const { accounts, isLoading: accountsLoading } = useAccounts();
 
   const [filter, setFilter] = React.useState<string>(ALL_ACCOUNTS);
-  const [selected, setSelected] = React.useState<{
-    accountId: string;
-    id: string;
-  } | null>(null);
+  const [query, setQuery] = React.useState("");
+  const [debouncedQuery, setDebouncedQuery] = React.useState("");
+  const [selected, setSelected] = React.useState<ReaderSelection | null>(null);
 
   const [composeOpen, setComposeOpen] = React.useState(false);
   const [prefill, setPrefill] = React.useState<ComposePrefill | undefined>();
 
+  // Debounce the search term into the SWR key.
+  React.useEffect(() => {
+    const id = window.setTimeout(
+      () => setDebouncedQuery(query),
+      SEARCH_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(id);
+  }, [query]);
+
   const { data, error, isLoading, isValidating, mutate } =
     useSWR<MailListResponse>(
-      accounts.length > 0 ? mailKey(filter) : null,
+      accounts.length > 0 ? mailKey(filter, debouncedQuery) : null,
       fetcher,
       { revalidateOnFocus: false },
     );
@@ -55,6 +71,11 @@ export default function InboxPage() {
   const messages: UnifiedMessage[] = React.useMemo(
     () => data?.messages ?? [],
     [data?.messages],
+  );
+
+  const conversations: Conversation[] = React.useMemo(
+    () => groupConversations(messages),
+    [messages],
   );
 
   // Surface per-account failures without blocking the messages that loaded.
@@ -85,19 +106,29 @@ export default function InboxPage() {
     }
   }, [error]);
 
-  // Drop the selection if the selected message is no longer in the list.
+  // Drop the selection if its conversation is no longer in the list.
   React.useEffect(() => {
     if (!selected) return;
-    const stillPresent = messages.some(
-      (m) => m.id === selected.id && m.accountId === selected.accountId,
+    const stillPresent = conversations.some(
+      (c) =>
+        c.accountId === selected.accountId &&
+        (c.threadId ?? c.latest.id) === (selected.threadId ?? selected.messageId),
     );
     if (!stillPresent && !isLoading && !isValidating) {
       setSelected(null);
     }
-  }, [messages, selected, isLoading, isValidating]);
+  }, [conversations, selected, isLoading, isValidating]);
 
-  const handleSelect = React.useCallback((message: UnifiedMessage) => {
-    setSelected({ accountId: message.accountId, id: message.id });
+  const selectedKey = selected
+    ? `${selected.accountId}:${selected.threadId ?? selected.messageId}`
+    : null;
+
+  const handleSelect = React.useCallback((conversation: Conversation) => {
+    setSelected({
+      accountId: conversation.accountId,
+      threadId: conversation.threadId,
+      messageId: conversation.latest.id,
+    });
   }, []);
 
   const handleCompose = React.useCallback(() => {
@@ -147,8 +178,13 @@ export default function InboxPage() {
         disabled={accountsLoading}
       />
 
-      {/* Account filter row */}
-      <div className="shrink-0 border-b border-border px-4 pt-3">
+      {/* Search + account filter row */}
+      <div className="shrink-0 space-y-3 border-b border-border px-4 pb-1 pt-3">
+        <SearchInput
+          value={query}
+          onChange={setQuery}
+          disabled={accountsLoading}
+        />
         {accountsLoading ? (
           <div className="flex gap-2 pb-3">
             <Skeleton className="h-8 w-14 rounded-full" />
@@ -176,10 +212,11 @@ export default function InboxPage() {
           )}
         >
           <MailList
-            messages={messages}
+            conversations={conversations}
             accounts={accounts}
             isLoading={isLoading || accountsLoading}
-            selectedId={selected?.id ?? null}
+            selectedKey={selectedKey}
+            query={debouncedQuery}
             onSelect={handleSelect}
           />
         </section>

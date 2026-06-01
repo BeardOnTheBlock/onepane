@@ -7,12 +7,16 @@
 // before calling these methods, so we simply use it as a Bearer token.
 // ============================================================================
 
+import { randomBytes } from "node:crypto";
+
 import { googleMapsUrl } from "@/lib/utils";
 import type {
   AccountWithTokens,
+  AttachmentMeta,
   CalendarProvider,
   ConferenceType,
   DateRange,
+  DownloadedAttachment,
   EventAttendee,
   EventDraft,
   MailAddress,
@@ -97,6 +101,23 @@ function encodeBase64Url(raw: string): string {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+/**
+ * Re-encodes Gmail's URL-safe base64 attachment data as standard base64.
+ * Gmail returns attachment bytes as base64url; the rest of the app (the API
+ * layer and the OutgoingAttachment/DownloadedAttachment contracts) speaks
+ * standard base64, so we round-trip through a Buffer to normalise.
+ */
+function base64UrlToStandardBase64(data: string): string {
+  if (!data) return "";
+  const normalised = data.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(normalised, "base64").toString("base64");
+}
+
+/** Splits a base64 string into 76-character lines (RFC 2045 MIME). */
+function wrapBase64(data: string): string {
+  return data.replace(/.{1,76}/g, "$&\r\n").replace(/\r\n$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -197,21 +218,46 @@ interface WalkResult {
   textBodies: string[];
   htmlBodies: string[];
   hasAttachments: boolean;
+  attachments: AttachmentMeta[];
+}
+
+/**
+ * Decides whether an attachment part is referenced inline in the body (a
+ * cid: image rendered inside the HTML) rather than being a standalone file.
+ * Inline parts carry either a Content-Disposition of "inline" or a
+ * Content-ID / X-Attachment-Id header.
+ */
+function isInlinePart(part: GmailPart): boolean {
+  const disposition = header(part.headers, "Content-Disposition").toLowerCase();
+  if (disposition.includes("inline")) return true;
+  if (header(part.headers, "Content-ID")) return true;
+  if (header(part.headers, "X-Attachment-Id")) return true;
+  return false;
 }
 
 /**
  * Recursively walks a Gmail payload, collecting decoded text/plain and
- * text/html bodies and detecting attachments (parts with a non-empty
- * filename).
+ * text/html bodies and the metadata for every attachment part (any part with
+ * a non-empty filename and a body.attachmentId).
  */
 function walkParts(part: GmailPart | undefined, acc: WalkResult): void {
   if (!part) return;
 
   const mime = part.mimeType ?? "";
 
-  // Any part with a filename is treated as an attachment.
-  if (part.filename && part.filename.length > 0) {
-    acc.hasAttachments = true;
+  // A part with a filename AND an attachmentId is a real attachment (file or
+  // inline image). Bodies (text/plain, text/html) have data but no filename.
+  if (part.filename && part.filename.length > 0 && part.body?.attachmentId) {
+    const inline = isInlinePart(part);
+    acc.attachments.push({
+      id: part.body.attachmentId,
+      filename: part.filename,
+      mimeType: part.mimeType || "application/octet-stream",
+      size: part.body.size ?? 0,
+      inline,
+    });
+    // hasAttachments reflects only real, downloadable (non-inline) files.
+    if (!inline) acc.hasAttachments = true;
   }
 
   if (mime === "text/plain" && part.body?.data && !part.filename) {
@@ -259,14 +305,56 @@ function toUnifiedMessage(
   };
 }
 
+/**
+ * Maps a fully-fetched Gmail message (format=full) into a UnifiedMessageFull.
+ * Shared by getMessage and getThread so the two never diverge.
+ */
+function toFullMessage(
+  account: AccountWithTokens,
+  msg: GmailMessage,
+): UnifiedMessageFull {
+  const headers = msg.payload?.headers;
+  const base = toUnifiedMessage(account, msg);
+
+  const acc: WalkResult = {
+    textBodies: [],
+    htmlBodies: [],
+    hasAttachments: false,
+    attachments: [],
+  };
+  walkParts(msg.payload, acc);
+
+  const bodyText = acc.textBodies.length ? acc.textBodies.join("\n") : null;
+  const bodyHtml = acc.htmlBodies.length ? acc.htmlBodies.join("\n") : null;
+
+  return {
+    ...base,
+    // `toFullMessage` walks the full payload, so prefer its richer detection.
+    hasAttachments: acc.hasAttachments || base.hasAttachments,
+    cc: parseAddressList(header(headers, "Cc")),
+    bodyHtml,
+    bodyText,
+    messageIdHeader: header(headers, "Message-ID") || null,
+    references: header(headers, "References") || null,
+    attachments: acc.attachments,
+  };
+}
+
 export const googleMailProvider: MailProvider = {
   async listMessages(
     account: AccountWithTokens,
     limit: number,
+    query?: string,
   ): Promise<UnifiedMessage[]> {
+    // A non-empty query performs a full-text mailbox search (Gmail search
+    // syntax); otherwise we list the inbox exactly as before.
+    const q = typeof query === "string" && query.trim().length > 0
+      ? query
+      : "in:inbox";
+
     const listUrl =
       `${GMAIL_BASE}/messages?maxResults=${encodeURIComponent(String(limit))}` +
-      `&q=${encodeURIComponent("in:inbox")}`;
+      `&q=${encodeURIComponent(q)}`;
 
     const list = await gfetchJson<{
       messages?: Array<{ id: string; threadId: string }>;
@@ -297,33 +385,58 @@ export const googleMailProvider: MailProvider = {
   ): Promise<UnifiedMessageFull> {
     const url = `${GMAIL_BASE}/messages/${encodeURIComponent(messageId)}?format=full`;
     const msg = await gfetchJson<GmailMessage>(url, account.accessToken);
+    return toFullMessage(account, msg);
+  },
 
-    const headers = msg.payload?.headers;
-    const base = toUnifiedMessage(account, msg);
+  async getThread(
+    account: AccountWithTokens,
+    threadId: string,
+  ): Promise<UnifiedMessageFull[]> {
+    const url = `${GMAIL_BASE}/threads/${encodeURIComponent(threadId)}?format=full`;
+    const thread = await gfetchJson<{ messages?: GmailMessage[] }>(
+      url,
+      account.accessToken,
+    );
 
-    const acc: WalkResult = {
-      textBodies: [],
-      htmlBodies: [],
-      hasAttachments: false,
-    };
-    walkParts(msg.payload, acc);
+    const messages = (thread.messages ?? []).map((msg) =>
+      toFullMessage(account, msg),
+    );
 
-    const bodyText = acc.textBodies.length
-      ? acc.textBodies.join("\n")
-      : null;
-    const bodyHtml = acc.htmlBodies.length
-      ? acc.htmlBodies.join("\n")
-      : null;
+    // Gmail returns thread messages in order, but sort defensively to
+    // guarantee oldest-first regardless of API ordering.
+    messages.sort(
+      (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+    );
+
+    return messages;
+  },
+
+  async getAttachment(
+    account: AccountWithTokens,
+    messageId: string,
+    attachmentId: string,
+  ): Promise<DownloadedAttachment> {
+    // The attachment endpoint only returns { size, data }, so first fetch the
+    // full message to recover the part's filename and mimeType.
+    const msgUrl = `${GMAIL_BASE}/messages/${encodeURIComponent(messageId)}?format=full`;
+    const msg = await gfetchJson<GmailMessage>(msgUrl, account.accessToken);
+
+    const part = findAttachmentPart(msg.payload, attachmentId);
+    const filename = part?.filename || "attachment";
+    const mimeType = part?.mimeType || "application/octet-stream";
+
+    const attUrl =
+      `${GMAIL_BASE}/messages/${encodeURIComponent(messageId)}` +
+      `/attachments/${encodeURIComponent(attachmentId)}`;
+    const data = await gfetchJson<{ data?: string; size?: number }>(
+      attUrl,
+      account.accessToken,
+    );
 
     return {
-      ...base,
-      // `getMessage` walks the full payload, so prefer its richer detection.
-      hasAttachments: acc.hasAttachments || base.hasAttachments,
-      cc: parseAddressList(header(headers, "Cc")),
-      bodyHtml,
-      bodyText,
-      messageIdHeader: header(headers, "Message-ID") || null,
-      references: header(headers, "References") || null,
+      filename,
+      mimeType,
+      contentBase64: base64UrlToStandardBase64(data.data ?? ""),
     };
   },
 
@@ -333,31 +446,79 @@ export const googleMailProvider: MailProvider = {
     reply?: ReplyContext,
   ): Promise<void> {
     const useHtml = typeof draft.bodyHtml === "string" && draft.bodyHtml.length > 0;
-    const contentType = useHtml
+    const bodyContentType = useHtml
       ? 'text/html; charset="utf-8"'
       : 'text/plain; charset="utf-8"';
     const body = useHtml ? (draft.bodyHtml as string) : draft.bodyText;
 
-    const lines: string[] = [];
-    lines.push(`From: ${account.email}`);
-    lines.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
+    const attachments = draft.attachments ?? [];
+    const hasAttachments = attachments.length > 0;
+
+    // Top-level headers, shared by both the single-part and multipart paths.
+    const topHeaders: string[] = [];
+    topHeaders.push(`From: ${account.email}`);
+    topHeaders.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
     if (draft.cc && draft.cc.length > 0) {
-      lines.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
+      topHeaders.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
     }
-    lines.push(`Subject: ${draft.subject}`);
-    lines.push("MIME-Version: 1.0");
-    lines.push(`Content-Type: ${contentType}`);
+    topHeaders.push(`Subject: ${draft.subject}`);
+    topHeaders.push("MIME-Version: 1.0");
 
     if (reply?.messageIdHeader) {
-      lines.push(`In-Reply-To: ${reply.messageIdHeader}`);
+      topHeaders.push(`In-Reply-To: ${reply.messageIdHeader}`);
       const references = reply.references
         ? `${reply.references} ${reply.messageIdHeader}`
         : reply.messageIdHeader;
-      lines.push(`References: ${references}`);
+      topHeaders.push(`References: ${references}`);
     }
 
-    // Blank line separates headers from the body (RFC 2822).
-    const rawMessage = `${lines.join("\r\n")}\r\n\r\n${body}`;
+    let rawMessage: string;
+
+    if (hasAttachments) {
+      // multipart/mixed: a single body part followed by one part per file.
+      const boundary = `==onepane_${randomBytes(16).toString("hex")}==`;
+      topHeaders.push(
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      );
+
+      const segments: string[] = [];
+
+      // Body part.
+      segments.push(
+        [
+          `--${boundary}`,
+          `Content-Type: ${bodyContentType}`,
+          "Content-Transfer-Encoding: 7bit",
+          "",
+          body,
+        ].join("\r\n"),
+      );
+
+      // Attachment parts.
+      for (const att of attachments) {
+        const filename = att.filename || "attachment";
+        const mimeType = att.mimeType || "application/octet-stream";
+        segments.push(
+          [
+            `--${boundary}`,
+            `Content-Type: ${mimeType}; name="${filename}"`,
+            "Content-Transfer-Encoding: base64",
+            `Content-Disposition: attachment; filename="${filename}"`,
+            "",
+            wrapBase64(att.contentBase64),
+          ].join("\r\n"),
+        );
+      }
+
+      // Closing boundary.
+      const bodyBlock = `${segments.join("\r\n")}\r\n--${boundary}--`;
+      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${bodyBlock}`;
+    } else {
+      // Single-part path — unchanged from the original implementation.
+      topHeaders.push(`Content-Type: ${bodyContentType}`);
+      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${body}`;
+    }
+
     const raw = encodeBase64Url(rawMessage);
 
     const payload: { raw: string; threadId?: string } = { raw };
@@ -371,6 +532,25 @@ export const googleMailProvider: MailProvider = {
     });
   },
 };
+
+/**
+ * Recursively searches a Gmail payload for the part whose body.attachmentId
+ * matches, so getAttachment can recover its filename and mimeType.
+ */
+function findAttachmentPart(
+  part: GmailPart | undefined,
+  attachmentId: string,
+): GmailPart | null {
+  if (!part) return null;
+  if (part.body?.attachmentId === attachmentId) return part;
+  if (part.parts) {
+    for (const child of part.parts) {
+      const found = findAttachmentPart(child, attachmentId);
+      if (found) return found;
+    }
+  }
+  return null;
+}
 
 /** Renders a MailAddress for an RFC 2822 header value. */
 function formatHeaderAddress(addr: MailAddress): string {

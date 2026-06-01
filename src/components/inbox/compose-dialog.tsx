@@ -1,10 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Send } from "lucide-react";
+import { Loader2, Paperclip, Send, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { AccountDot } from "@/components/account-dot";
+import { formatBytes } from "@/components/inbox/attachment-list";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -32,8 +33,32 @@ import type {
   MailAddress,
   MailDraft,
   OkResponse,
+  OutgoingAttachment,
   ReplyContext,
 } from "@/lib/types";
+
+/** Total attachment size cap (sum of raw file bytes) for a single message. */
+const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** A picked attachment held in compose state (base64 + size for the cap/chips). */
+interface PendingAttachment extends OutgoingAttachment {
+  /** Raw file size in bytes, used for the chip label and the total-size cap. */
+  size: number;
+}
+
+/** Reads a File as standard base64 (strips the "data:...;base64," prefix). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Read failed"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 /** A pre-fill payload supplied when composing a reply. */
 export interface ComposePrefill {
@@ -87,7 +112,10 @@ export function ComposeDialog({
   const [showCc, setShowCc] = React.useState(false);
   const [subject, setSubject] = React.useState("");
   const [body, setBody] = React.useState("");
+  const [attachments, setAttachments] = React.useState<PendingAttachment[]>([]);
   const [sending, setSending] = React.useState(false);
+
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   // Initialise (or reset) the form whenever the dialog opens.
   React.useEffect(() => {
@@ -104,10 +132,56 @@ export function ComposeDialog({
     setCc("");
     setShowCc(false);
     setBody("");
+    setAttachments([]);
     setSending(false);
     // We intentionally only re-run when the dialog transitions open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  const totalAttachmentBytes = React.useMemo(
+    () => attachments.reduce((sum, a) => sum + a.size, 0),
+    [attachments],
+  );
+
+  async function handleFilesChosen(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) return;
+    const chosen = Array.from(fileList);
+
+    // Accumulate against the current total so multiple picks stay under the cap.
+    let runningTotal = totalAttachmentBytes;
+    const accepted: PendingAttachment[] = [];
+
+    for (const file of chosen) {
+      if (runningTotal + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+        toast.error(
+          `"${file.name}" exceeds the ${formatBytes(
+            MAX_TOTAL_ATTACHMENT_BYTES,
+          )} attachment limit.`,
+        );
+        continue;
+      }
+      try {
+        const contentBase64 = await fileToBase64(file);
+        accepted.push({
+          filename: file.name,
+          mimeType: file.type || "application/octet-stream",
+          contentBase64,
+          size: file.size,
+        });
+        runningTotal += file.size;
+      } catch {
+        toast.error(`Couldn't read "${file.name}".`);
+      }
+    }
+
+    if (accepted.length > 0) {
+      setAttachments((prev) => [...prev, ...accepted]);
+    }
+  }
+
+  function removeAttachment(index: number) {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  }
 
   const recipients = React.useMemo(() => parseRecipients(to), [to]);
   const ccRecipients = React.useMemo(() => parseRecipients(cc), [cc]);
@@ -129,11 +203,20 @@ export function ComposeDialog({
     if (!canSend) return;
     setSending(true);
 
+    const outgoing: OutgoingAttachment[] = attachments.map(
+      ({ filename, mimeType, contentBase64 }) => ({
+        filename,
+        mimeType,
+        contentBase64,
+      }),
+    );
+
     const draft: MailDraft = {
       to: recipients,
       subject: subject.trim(),
       bodyText: body,
       ...(showCc && ccRecipients.length > 0 ? { cc: ccRecipients } : {}),
+      ...(outgoing.length > 0 ? { attachments: outgoing } : {}),
     };
 
     try {
@@ -278,6 +361,82 @@ export function ComposeDialog({
               onChange={(e) => setBody(e.target.value)}
               className={cn("min-h-[180px] resize-y scrollbar-thin")}
             />
+          </div>
+
+          {/* Attachments */}
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={sending}
+              >
+                <Paperclip aria-hidden="true" />
+                Attach files
+              </Button>
+              {attachments.length > 0 ? (
+                <span className="text-xs text-muted-foreground">
+                  {formatBytes(totalAttachmentBytes)} of{" "}
+                  {formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)}
+                </span>
+              ) : null}
+            </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              aria-hidden="true"
+              tabIndex={-1}
+              onChange={(e) => {
+                void handleFilesChosen(e.target.files);
+                // Reset so re-picking the same file fires onChange again.
+                e.target.value = "";
+              }}
+            />
+
+            {attachments.length > 0 ? (
+              <ul className="flex flex-wrap gap-2">
+                {attachments.map((att, index) => {
+                  const size = formatBytes(att.size);
+                  return (
+                    <li
+                      key={`${att.filename}:${index}`}
+                      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-muted/40 py-1 pl-2.5 pr-1 text-xs"
+                    >
+                      <Paperclip
+                        className="h-3 w-3 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <span
+                        className="min-w-0 max-w-[14rem] truncate text-foreground"
+                        title={att.filename}
+                      >
+                        {att.filename}
+                      </span>
+                      {size ? (
+                        <span className="shrink-0 text-muted-foreground">
+                          {size}
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(index)}
+                        disabled={sending}
+                        aria-label={`Remove ${att.filename}`}
+                        title={`Remove ${att.filename}`}
+                        className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+                      >
+                        <X className="h-3 w-3" aria-hidden="true" />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
           </div>
         </div>
 

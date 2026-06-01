@@ -12,10 +12,12 @@
 import { googleMapsUrl } from "@/lib/utils";
 import type {
   AccountWithTokens,
+  AttachmentMeta,
   AttendeeResponse,
   CalendarProvider,
   ConferenceType,
   DateRange,
+  DownloadedAttachment,
   EventAttendee,
   EventDraft,
   MailAddress,
@@ -83,6 +85,18 @@ interface GraphItemBody {
   content?: string | null;
 }
 
+interface GraphAttachment {
+  "@odata.type"?: string | null;
+  id?: string | null;
+  name?: string | null;
+  contentType?: string | null;
+  size?: number | null;
+  isInline?: boolean | null;
+  /** Standard base64 of the file bytes; only present when downloading a single
+   *  fileAttachment, not when expanded in a list. */
+  contentBytes?: string | null;
+}
+
 interface GraphMessage {
   id: string;
   conversationId?: string | null;
@@ -96,6 +110,7 @@ interface GraphMessage {
   bodyPreview?: string | null;
   body?: GraphItemBody | null;
   internetMessageId?: string | null;
+  attachments?: GraphAttachment[] | null;
 }
 
 interface GraphDateTimeTimeZone {
@@ -178,6 +193,29 @@ function toGraphRecipients(addresses: MailAddress[]): Array<{
   }));
 }
 
+/**
+ * Map Graph's expanded attachments collection to our AttachmentMeta[]. Only
+ * file attachments are downloadable; item/reference attachments are skipped.
+ */
+function toAttachmentMetas(
+  attachments: GraphAttachment[] | null | undefined,
+): AttachmentMeta[] {
+  if (!attachments) return [];
+  const out: AttachmentMeta[] = [];
+  for (const a of attachments) {
+    if (a?.["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+    if (!a.id) continue;
+    out.push({
+      id: a.id,
+      filename: a.name ?? "",
+      mimeType: a.contentType || "application/octet-stream",
+      size: a.size ?? 0,
+      inline: Boolean(a.isInline),
+    });
+  }
+  return out;
+}
+
 /** Map a Graph message to the unified inbox-list shape. */
 function mapMessage(account: AccountWithTokens, m: GraphMessage): UnifiedMessage {
   return {
@@ -192,6 +230,32 @@ function mapMessage(account: AccountWithTokens, m: GraphMessage): UnifiedMessage
     date: m.receivedDateTime ?? "",
     unread: !(m.isRead ?? false),
     hasAttachments: m.hasAttachments ?? false,
+  };
+}
+
+/**
+ * Map a fully-loaded Graph message (with body, ccRecipients, internetMessageId
+ * and an expanded attachments collection) to UnifiedMessageFull. Shared by
+ * getMessage and getThread so both surface identical message details.
+ */
+function toFullMessage(
+  account: AccountWithTokens,
+  m: GraphMessage,
+): UnifiedMessageFull {
+  const base = mapMessage(account, m);
+
+  const contentType = (m.body?.contentType ?? "").toLowerCase();
+  const content = m.body?.content ?? null;
+  const isHtml = contentType === "html";
+
+  return {
+    ...base,
+    cc: toMailAddresses(m.ccRecipients),
+    bodyHtml: isHtml ? content : null,
+    bodyText: isHtml ? null : content,
+    messageIdHeader: m.internetMessageId ?? null,
+    references: null,
+    attachments: toAttachmentMetas(m.attachments),
   };
 }
 
@@ -289,14 +353,31 @@ export const microsoftMailProvider: MailProvider = {
   async listMessages(
     account: AccountWithTokens,
     limit: number,
+    query?: string,
   ): Promise<UnifiedMessage[]> {
     const select =
       "id,conversationId,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview";
-    const url =
-      `${GRAPH_BASE}/me/mailFolders/inbox/messages` +
-      `?$top=${encodeURIComponent(String(limit))}` +
-      `&$orderby=${encodeURIComponent("receivedDateTime desc")}` +
-      `&$select=${encodeURIComponent(select)}`;
+    const trimmed = query?.trim() ?? "";
+
+    let url: string;
+    if (trimmed) {
+      // Full-text search across the whole mailbox. Graph forbids combining
+      // $search with $orderby, so we drop $orderby and take results by
+      // relevance. Escape any embedded double-quotes in the search term.
+      const escaped = trimmed.replace(/"/g, '\\"');
+      url =
+        `${GRAPH_BASE}/me/messages` +
+        `?$top=${encodeURIComponent(String(limit))}` +
+        `&$search=${encodeURIComponent(`"${escaped}"`)}` +
+        `&$select=${encodeURIComponent(select)}`;
+    } else {
+      // Default inbox listing, newest first.
+      url =
+        `${GRAPH_BASE}/me/mailFolders/inbox/messages` +
+        `?$top=${encodeURIComponent(String(limit))}` +
+        `&$orderby=${encodeURIComponent("receivedDateTime desc")}` +
+        `&$select=${encodeURIComponent(select)}`;
+    }
 
     const res = await gfetch(url, account.accessToken);
     const data = (await res.json()) as GraphList<GraphMessage>;
@@ -309,26 +390,60 @@ export const microsoftMailProvider: MailProvider = {
   ): Promise<UnifiedMessageFull> {
     const select =
       "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview,body,internetMessageId";
+    const expand = "attachments($select=id,name,contentType,size,isInline)";
     const url =
       `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageId)}` +
-      `?$select=${encodeURIComponent(select)}`;
+      `?$select=${encodeURIComponent(select)}` +
+      `&$expand=${encodeURIComponent(expand)}`;
 
     const res = await gfetch(url, account.accessToken);
     const m = (await res.json()) as GraphMessage;
 
-    const base = mapMessage(account, m);
+    return toFullMessage(account, m);
+  },
 
-    const contentType = (m.body?.contentType ?? "").toLowerCase();
-    const content = m.body?.content ?? null;
-    const isHtml = contentType === "html";
+  async getThread(
+    account: AccountWithTokens,
+    threadId: string,
+  ): Promise<UnifiedMessageFull[]> {
+    const select =
+      "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview,body,internetMessageId";
+    const expand = "attachments($select=id,name,contentType,size,isInline)";
+    // Graph restricts combining $filter with $orderby on messages, so we sort
+    // ascending (oldest first) in JS after fetching. Escape single quotes in
+    // the conversation id by doubling them (OData string-literal escaping).
+    const escapedId = threadId.replace(/'/g, "''");
+    const filter = `conversationId eq '${escapedId}'`;
+    const url =
+      `${GRAPH_BASE}/me/messages` +
+      `?$filter=${encodeURIComponent(filter)}` +
+      `&$select=${encodeURIComponent(select)}` +
+      `&$expand=${encodeURIComponent(expand)}` +
+      `&$top=100`;
+
+    const res = await gfetch(url, account.accessToken);
+    const data = (await res.json()) as GraphList<GraphMessage>;
+    const messages = (data.value ?? []).map((m) => toFullMessage(account, m));
+    messages.sort((a, b) => a.date.localeCompare(b.date));
+    return messages;
+  },
+
+  async getAttachment(
+    account: AccountWithTokens,
+    messageId: string,
+    attachmentId: string,
+  ): Promise<DownloadedAttachment> {
+    const url =
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(messageId)}` +
+      `/attachments/${encodeURIComponent(attachmentId)}`;
+
+    const res = await gfetch(url, account.accessToken);
+    const a = (await res.json()) as GraphAttachment;
 
     return {
-      ...base,
-      cc: toMailAddresses(m.ccRecipients),
-      bodyHtml: isHtml ? content : null,
-      bodyText: isHtml ? null : content,
-      messageIdHeader: m.internetMessageId ?? null,
-      references: null,
+      filename: a.name || "attachment",
+      mimeType: a.contentType || "application/octet-stream",
+      contentBase64: a.contentBytes ?? "",
     };
   },
 
@@ -343,15 +458,27 @@ export const microsoftMailProvider: MailProvider = {
       content: draft.bodyHtml ?? draft.bodyText,
     };
 
+    // Graph fileAttachment objects, built once and reused on both paths.
+    const graphAttachments = (draft.attachments ?? []).map((a) => ({
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      name: a.filename,
+      contentType: a.mimeType,
+      contentBytes: a.contentBase64,
+    }));
+
     if (!reply) {
       // New, standalone message.
+      const message: Record<string, unknown> = {
+        subject: draft.subject,
+        body,
+        toRecipients: toGraphRecipients(draft.to),
+        ccRecipients: toGraphRecipients(draft.cc ?? []),
+      };
+      if (graphAttachments.length > 0) {
+        message.attachments = graphAttachments;
+      }
       const payload = {
-        message: {
-          subject: draft.subject,
-          body,
-          toRecipients: toGraphRecipients(draft.to),
-          ccRecipients: toGraphRecipients(draft.cc ?? []),
-        },
+        message,
         saveToSentItems: true,
       };
       await gfetch(`${GRAPH_BASE}/me/sendMail`, account.accessToken, {
@@ -386,7 +513,19 @@ export const microsoftMailProvider: MailProvider = {
       },
     );
 
-    // 3) Send the draft.
+    // 3) Attach any files to the draft (one POST per attachment) before sending.
+    for (const attachment of graphAttachments) {
+      await gfetch(
+        `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/attachments`,
+        account.accessToken,
+        {
+          method: "POST",
+          body: JSON.stringify(attachment),
+        },
+      );
+    }
+
+    // 4) Send the draft.
     await gfetch(
       `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
       account.accessToken,

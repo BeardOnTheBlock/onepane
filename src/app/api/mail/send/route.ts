@@ -5,7 +5,12 @@
 import { getAccountWithTokens } from "@/lib/accounts";
 import { getValidAccessToken } from "@/lib/oauth";
 import { getMailProvider } from "@/lib/providers";
-import type { MailAddress, MailDraft, ReplyContext } from "@/lib/types";
+import type {
+  MailAddress,
+  MailDraft,
+  OutgoingAttachment,
+  ReplyContext,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,6 +32,25 @@ function isMailAddress(value: unknown): value is MailAddress {
 
 function isMailAddressArray(value: unknown): value is MailAddress[] {
   return Array.isArray(value) && value.every(isMailAddress);
+}
+
+/** At most 10 files per message. */
+const MAX_ATTACHMENTS = 10;
+/** Provider hard limit for the total decoded payload (matches Gmail/Graph). */
+const MAX_ATTACHMENTS_BYTES = 25 * 1024 * 1024;
+
+function isOutgoingAttachment(value: unknown): value is OutgoingAttachment {
+  if (typeof value !== "object" || value === null) return false;
+  const { filename, mimeType, contentBase64 } = value as {
+    filename?: unknown;
+    mimeType?: unknown;
+    contentBase64?: unknown;
+  };
+  return (
+    typeof filename === "string" &&
+    typeof mimeType === "string" &&
+    typeof contentBase64 === "string"
+  );
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -69,12 +93,39 @@ export async function POST(req: Request): Promise<Response> {
     return badRequest("'draft.bodyHtml' must be a string.");
   }
 
+  let attachments: OutgoingAttachment[] | undefined;
+  if (d.attachments !== undefined) {
+    if (!Array.isArray(d.attachments)) {
+      return badRequest("'draft.attachments' must be an array.");
+    }
+    if (!d.attachments.every(isOutgoingAttachment)) {
+      return badRequest(
+        "Each attachment needs string 'filename', 'mimeType', and 'contentBase64'.",
+      );
+    }
+    if (d.attachments.length > MAX_ATTACHMENTS) {
+      return badRequest(
+        `A message can have at most ${MAX_ATTACHMENTS} attachments.`,
+      );
+    }
+    // Estimate the decoded byte size from the base64 length (4 chars => 3 bytes).
+    const estimatedBytes = d.attachments.reduce(
+      (sum, a) => sum + a.contentBase64.length * 0.75,
+      0,
+    );
+    if (estimatedBytes > MAX_ATTACHMENTS_BYTES) {
+      return badRequest("Attachments exceed the 25 MB limit.");
+    }
+    attachments = d.attachments;
+  }
+
   const validDraft: MailDraft = {
     to: d.to,
     subject: d.subject,
     bodyText: d.bodyText,
     ...(d.cc !== undefined ? { cc: d.cc } : {}),
     ...(typeof d.bodyHtml === "string" ? { bodyHtml: d.bodyHtml } : {}),
+    ...(attachments && attachments.length ? { attachments } : {}),
   };
 
   let replyContext: ReplyContext | undefined;
