@@ -1,0 +1,39 @@
+// OnePane local database schema.
+// SQLite keeps everything on your machine; OAuth tokens are encrypted at rest
+// (AES-256-GCM) by the application layer before they are written here.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A connected email/calendar account (one row per Google/Microsoft login).
+model Account {
+  id          String   @id @default(cuid())
+  provider    String // "google" | "microsoft"
+  email       String
+  displayName String?
+  // Hex color used to colour-code this account across the inbox + calendar UI.
+  color       String   @default("#6366f1")
+  // Whether the account can host Microsoft Teams meetings (work/school accounts).
+  canTeams    Boolean  @default(false)
+  // Whether the account can create Google Meet links (all Google accounts).
+  canMeet     Boolean  @default(false)
+
+  // --- Encrypted secrets (AES-256-GCM, "iv:tag:ciphertext" base64) ---
+  accessToken  String
+  refreshToken String?
+
+  tokenExpiry DateTime // when the access token expires
+  scopes      String   @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // A provider+email pair is unique so re-connecting updates the same row.
+  @@unique([provider, email])
+}
