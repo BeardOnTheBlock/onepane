@@ -6,14 +6,17 @@ import { AlertCircle, MailOpen, Reply } from "lucide-react";
 
 import { AccountBadge } from "@/components/account-badge";
 import { EmptyState } from "@/components/empty-state";
+import { MessageActions } from "@/components/inbox/message-actions";
 import { ThreadMessage } from "@/components/inbox/thread-message";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { accountById } from "@/hooks/use-accounts";
+import type { ActionTarget } from "@/hooks/use-mail-actions";
 import { fetcher } from "@/lib/fetcher";
 import type {
   AccountPublic,
+  MailActionType,
   MailMessageResponse,
   MailThreadResponse,
   UnifiedMessageFull,
@@ -31,6 +34,8 @@ export interface MailReaderProps {
   selected: ReaderSelection | null;
   accounts: AccountPublic[];
   onReply: (prefill: ComposePrefill) => void;
+  /** Apply a triage action to a target set of messages. */
+  onAction: (target: ActionTarget, action: MailActionType) => void;
 }
 
 /** Build the reply pre-fill from a fully-loaded message (the latest in a thread). */
@@ -77,10 +82,15 @@ function messagesFrom(
   return single ? [single] : [];
 }
 
-export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
+export function MailReader({
+  selected,
+  accounts,
+  onReply,
+  onAction,
+}: MailReaderProps) {
   const key = readerKey(selected);
 
-  const { data, error, isLoading } = useSWR<
+  const { data, error, isLoading, mutate } = useSWR<
     MailThreadResponse | MailMessageResponse
   >(key, fetcher);
 
@@ -88,6 +98,60 @@ export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
     () => (selected ? messagesFrom(selected, data) : []),
     [selected, data],
   );
+
+  // Target every loaded message in the open conversation.
+  const accountId = selected?.accountId ?? "";
+  const messageIds = React.useMemo(
+    () => messages.map((m) => m.id),
+    [messages],
+  );
+  const target = React.useMemo<ActionTarget>(
+    () => ({ accountId, messageIds }),
+    [accountId, messageIds],
+  );
+
+  const anyUnread = messages.some((m) => m.unread);
+
+  // No starred flag on the message model — track the thread's star optimistically.
+  const [starred, setStarred] = React.useState(false);
+
+  // Run a triage action on the whole conversation, then refresh this thread so
+  // the cards reflect the new read/star state. (List revalidation + undo are
+  // owned by the page's useMailActions.)
+  const runAction = React.useCallback(
+    (action: MailActionType) => {
+      if (messageIds.length === 0) return;
+      if (action === "star") setStarred(true);
+      if (action === "unstar") setStarred(false);
+      onAction(target, action);
+      if (action !== "trash" && action !== "archive") {
+        void mutate();
+      }
+    },
+    [messageIds.length, onAction, target, mutate],
+  );
+
+  // Auto-mark the conversation read once when it opens, if it was unread.
+  const autoReadKey = key ?? "";
+  const autoReadDoneRef = React.useRef<string>("");
+  React.useEffect(() => {
+    if (!selected || messageIds.length === 0) return;
+    if (autoReadDoneRef.current === autoReadKey) return;
+    if (!anyUnread) {
+      autoReadDoneRef.current = autoReadKey;
+      return;
+    }
+    autoReadDoneRef.current = autoReadKey;
+    onAction(target, "markRead");
+    void mutate();
+    // Only re-run when the open conversation changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoReadKey, messageIds.length]);
+
+  // Reset the local star toggle when the open conversation changes.
+  React.useEffect(() => {
+    setStarred(false);
+  }, [autoReadKey]);
 
   // Track which message cards are expanded. We default to the latest expanded,
   // re-deriving whenever the conversation changes (keyed on its message ids).
@@ -161,16 +225,24 @@ export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
           <h2 className="min-w-0 break-words text-lg font-semibold leading-snug text-foreground">
             {subject}
           </h2>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="shrink-0"
-            onClick={() => onReply(buildReplyPrefill(latest))}
-          >
-            <Reply aria-hidden="true" />
-            Reply
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            <MessageActions
+              unread={anyUnread}
+              starred={starred}
+              onAction={runAction}
+              disabled={messageIds.length === 0}
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="ml-1 shrink-0"
+              onClick={() => onReply(buildReplyPrefill(latest))}
+            >
+              <Reply aria-hidden="true" />
+              Reply
+            </Button>
+          </div>
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -198,6 +270,15 @@ export function MailReader({ selected, accounts, onReply }: MailReaderProps) {
               account={accountById(accounts, message.accountId) ?? account}
               expanded={expanded.has(message.id)}
               onToggle={() => toggle(message.id)}
+              onAction={(action) => {
+                onAction(
+                  { accountId: message.accountId, messageIds: [message.id] },
+                  action,
+                );
+                if (action !== "trash" && action !== "archive") {
+                  void mutate();
+                }
+              }}
             />
           ))}
         </div>

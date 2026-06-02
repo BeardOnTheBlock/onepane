@@ -10,12 +10,12 @@ import { NextResponse } from "next/server";
 import { upsertAccount } from "@/lib/accounts";
 import { ALL_PROVIDERS, OAUTH_STATE_COOKIE } from "@/lib/config";
 import { exchangeCodeForTokens, fetchProfile } from "@/lib/oauth";
-import type { ProviderId } from "@/lib/types";
+import type { OAuthProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function isProviderId(value: string): value is ProviderId {
+function isProviderId(value: string): value is OAuthProviderId {
   return (ALL_PROVIDERS as string[]).includes(value);
 }
 

@@ -7,6 +7,7 @@ import { toast } from "sonner";
 
 import { AccountRow } from "@/components/settings/account-row";
 import { ConnectAccountCard } from "@/components/settings/connect-account-card";
+import { ImapConnectCard } from "@/components/settings/imap-connect-card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAccounts } from "@/hooks/use-accounts";
 import { useProviderCredentials } from "@/hooks/use-provider-credentials";
@@ -128,7 +129,7 @@ export default function SettingsPage() {
             encrypted on this machine), then run the consent flow. Tokens are
             stored encrypted here only.
           </p>
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <ConnectAccountCard
               provider="google"
               status={statuses?.google}
@@ -141,6 +142,7 @@ export default function SettingsPage() {
               isLoading={credsLoading}
               onChanged={mutateCreds}
             />
+            <ImapConnectCard />
           </div>
         </section>
 

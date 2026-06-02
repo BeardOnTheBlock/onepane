@@ -14,6 +14,7 @@ import {
 import { AlertTriangle, CalendarPlus, Inbox } from "lucide-react";
 
 import { AgendaView } from "@/components/calendar/agenda-view";
+import { CalendarPicker } from "@/components/calendar/calendar-picker";
 import {
   CalendarToolbar,
   type CalendarView,
@@ -25,8 +26,13 @@ import { WeekView } from "@/components/calendar/week-view";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { accountById, useAccounts } from "@/hooks/use-accounts";
+import {
+  calendarKey,
+  serializeCalendarSelection,
+  useCalendars,
+} from "@/hooks/use-calendars";
 import { fetcher } from "@/lib/fetcher";
-import type { CalendarListResponse, UnifiedEvent } from "@/lib/types";
+import type { CalendarInfo, CalendarListResponse, UnifiedEvent } from "@/lib/types";
 
 /**
  * The visible date range for a given view + anchor.
@@ -108,11 +114,52 @@ export default function CalendarPage() {
   const [detailOpen, setDetailOpen] = React.useState(false);
   const [composerOpen, setComposerOpen] = React.useState(false);
   const [composerDate, setComposerDate] = React.useState<Date | null>(null);
+  const [editEvent, setEditEvent] = React.useState<UnifiedEvent | null>(null);
+
+  // Calendar visibility: track the calendars the user has explicitly hidden, so
+  // calendars discovered later default to visible (the "all visible" default).
+  const [hiddenKeys, setHiddenKeys] = React.useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+
+  const {
+    calendars,
+    errors: calendarErrors,
+    isLoading: calendarsLoading,
+  } = useCalendars(selectedAccountId);
 
   const { start, end } = React.useMemo(
     () => rangeFor(view, anchor),
     [view, anchor],
   );
+
+  // The set of currently-visible calendars (every known calendar minus hidden).
+  const selectedKeys = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const c of calendars) {
+      const key = calendarKey(c.accountId, c.id);
+      if (!hiddenKeys.has(key)) set.add(key);
+    }
+    return set;
+  }, [calendars, hiddenKeys]);
+
+  function toggleCalendar(calendar: CalendarInfo, visible: boolean) {
+    const key = calendarKey(calendar.accountId, calendar.id);
+    setHiddenKeys((prev) => {
+      const next = new Set(prev);
+      if (visible) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  function setAllCalendars(visible: boolean) {
+    if (visible) {
+      setHiddenKeys(new Set());
+    } else {
+      setHiddenKeys(new Set(calendars.map((c) => calendarKey(c.accountId, c.id))));
+    }
+  }
 
   // If the selected account is removed, fall back to "all".
   React.useEffect(() => {
@@ -127,10 +174,23 @@ export default function CalendarPage() {
 
   const hasAccounts = accounts.length > 0;
 
+  // Once we know the calendars, prefer sending the explicit visible selection.
+  // Before they load (or with no calendars), omit the param so the server
+  // falls back to its default (primaries).
+  const allVisible =
+    calendars.length > 0 && selectedKeys.size === calendars.length;
+  const calendarsParam =
+    calendars.length === 0 || allVisible
+      ? null
+      : serializeCalendarSelection(calendars, selectedKeys);
+
   const swrKey = hasAccounts
     ? `/api/calendar?start=${encodeURIComponent(
         start.toISOString(),
-      )}&end=${encodeURIComponent(end.toISOString())}&accountId=${selectedAccountId}`
+      )}&end=${encodeURIComponent(end.toISOString())}&accountId=${selectedAccountId}` +
+      (calendarsParam !== null
+        ? `&calendars=${encodeURIComponent(calendarsParam)}`
+        : "")
     : null;
 
   const { data, error, isLoading, mutate } = useSWR<CalendarListResponse>(
@@ -154,6 +214,14 @@ export default function CalendarPage() {
   }
 
   function handleNewEvent() {
+    setEditEvent(null);
+    setComposerDate(null);
+    setComposerOpen(true);
+  }
+
+  function handleEditEvent(event: UnifiedEvent) {
+    setDetailOpen(false);
+    setEditEvent(event);
     setComposerDate(null);
     setComposerOpen(true);
   }
@@ -179,6 +247,19 @@ export default function CalendarPage() {
         onAccountChange={setSelectedAccountId}
         onNewEvent={handleNewEvent}
         canCreate={hasAccounts}
+        calendarPicker={
+          hasAccounts ? (
+            <CalendarPicker
+              accounts={accounts}
+              calendars={calendars}
+              selected={selectedKeys}
+              onToggle={toggleCalendar}
+              onSetAll={setAllCalendars}
+              isLoading={calendarsLoading}
+              errors={calendarErrors}
+            />
+          ) : undefined
+        }
       />
 
       {/* Per-account errors (non-blocking) */}
@@ -241,14 +322,20 @@ export default function CalendarPage() {
         account={detailAccount}
         open={detailOpen}
         onOpenChange={setDetailOpen}
+        onEdit={handleEditEvent}
+        onDeleted={() => mutate()}
+        onResponded={() => mutate()}
       />
       <EventComposerDialog
         open={composerOpen}
         onOpenChange={setComposerOpen}
         accounts={accounts}
+        calendars={calendars}
         defaultAccountId={composerDefaultAccount}
         initialDate={composerDate}
+        editEvent={editEvent}
         onCreated={() => mutate()}
+        onSaved={() => mutate()}
       />
     </div>
   );

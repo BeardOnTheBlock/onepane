@@ -13,14 +13,20 @@ import { googleMapsUrl } from "@/lib/utils";
 import type {
   AccountWithTokens,
   AttachmentMeta,
+  AttendeeResponse,
+  CalendarInfo,
   CalendarProvider,
   ConferenceType,
   DateRange,
   DownloadedAttachment,
+  DraftContent,
+  DraftSummary,
   EventAttendee,
   EventDraft,
+  MailActionType,
   MailAddress,
   MailDraft,
+  MailLabel,
   MailProvider,
   ReplyContext,
   UnifiedEvent,
@@ -30,6 +36,31 @@ import type {
 
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE = "https://www.googleapis.com/calendar/v3";
+
+// Gmail rejects too many simultaneous per-user requests with HTTP 429
+// ("Too many concurrent requests for user"), so fan-out fetches are pooled.
+const GMAIL_FETCH_CONCURRENCY = 4;
+
+/**
+ * Maps items through `fn` with a bounded number of in-flight calls, preserving
+ * input order. Keeps Gmail's per-user concurrency limit happy on list fan-outs.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    for (let i = cursor++; i < items.length; i = cursor++) {
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 // ---------------------------------------------------------------------------
 // Low-level fetch helper
@@ -145,6 +176,14 @@ interface GmailMessage {
   snippet?: string;
   internalDate?: string;
   payload?: GmailPart;
+}
+
+/** A Gmail label resource as returned by the /labels endpoints. */
+interface GmailLabel {
+  id: string;
+  name: string;
+  /** Gmail already classifies labels as "system" or "user". */
+  type?: "system" | "user";
 }
 
 /** Case-insensitive header lookup; returns the first matching value or "". */
@@ -280,6 +319,19 @@ function walkParts(part: GmailPart | undefined, acc: WalkResult): void {
 const METADATA_HEADERS =
   "metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date";
 
+/**
+ * Maps a Gmail label resource into the shared MailLabel contract. Gmail's
+ * `type` is already "system" | "user"; anything missing/unexpected is treated
+ * as a user label (the safe default — user labels are mutable/movable).
+ */
+function toMailLabel(label: GmailLabel): MailLabel {
+  return {
+    id: label.id,
+    name: label.name,
+    type: label.type === "system" ? "system" : "user",
+  };
+}
+
 function toUnifiedMessage(
   account: AccountWithTokens,
   msg: GmailMessage,
@@ -345,16 +397,32 @@ export const googleMailProvider: MailProvider = {
     account: AccountWithTokens,
     limit: number,
     query?: string,
+    labelId?: string,
   ): Promise<UnifiedMessage[]> {
-    // A non-empty query performs a full-text mailbox search (Gmail search
-    // syntax); otherwise we list the inbox exactly as before.
-    const q = typeof query === "string" && query.trim().length > 0
-      ? query
-      : "in:inbox";
+    // Build the message-list query string. Four cases:
+    //   labelId only      -> labelIds={labelId}  (the label/folder listing;
+    //                        deliberately NO q=in:inbox so we list that label)
+    //   query only        -> q={query}           (full-text Gmail search)
+    //   labelId AND query -> labelIds + q         (search scoped to the label)
+    //   neither           -> q=in:inbox           (default inbox listing)
+    const hasLabel = typeof labelId === "string" && labelId.trim().length > 0;
+    const hasQuery = typeof query === "string" && query.trim().length > 0;
 
-    const listUrl =
-      `${GMAIL_BASE}/messages?maxResults=${encodeURIComponent(String(limit))}` +
-      `&q=${encodeURIComponent(q)}`;
+    const params: string[] = [
+      `maxResults=${encodeURIComponent(String(limit))}`,
+    ];
+    if (hasLabel) {
+      params.push(`labelIds=${encodeURIComponent(labelId as string)}`);
+      if (hasQuery) {
+        params.push(`q=${encodeURIComponent(query as string)}`);
+      }
+    } else if (hasQuery) {
+      params.push(`q=${encodeURIComponent(query as string)}`);
+    } else {
+      params.push(`q=${encodeURIComponent("in:inbox")}`);
+    }
+
+    const listUrl = `${GMAIL_BASE}/messages?${params.join("&")}`;
 
     const list = await gfetchJson<{
       messages?: Array<{ id: string; threadId: string }>;
@@ -363,8 +431,10 @@ export const googleMailProvider: MailProvider = {
     const refs = list.messages ?? [];
     if (refs.length === 0) return [];
 
-    const messages = await Promise.all(
-      refs.map(async (ref) => {
+    const messages = await mapWithConcurrency(
+      refs,
+      GMAIL_FETCH_CONCURRENCY,
+      async (ref) => {
         const detailUrl =
           `${GMAIL_BASE}/messages/${encodeURIComponent(ref.id)}` +
           `?format=metadata&${METADATA_HEADERS}`;
@@ -373,10 +443,67 @@ export const googleMailProvider: MailProvider = {
           account.accessToken,
         );
         return toUnifiedMessage(account, msg);
-      }),
+      },
     );
 
     return messages;
+  },
+
+  async listLabels(account: AccountWithTokens): Promise<MailLabel[]> {
+    const data = await gfetchJson<{ labels?: GmailLabel[] }>(
+      `${GMAIL_BASE}/labels`,
+      account.accessToken,
+    );
+
+    const labels = (data.labels ?? [])
+      .filter((l): l is GmailLabel => Boolean(l && l.id && l.name))
+      .map(toMailLabel);
+
+    // System labels first, then user labels; alphabetical (case-insensitive)
+    // within each group for a stable, readable ordering.
+    labels.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "system" ? -1 : 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+
+    return labels;
+  },
+
+  async createLabel(
+    account: AccountWithTokens,
+    name: string,
+  ): Promise<MailLabel> {
+    const created = await gfetchJson<GmailLabel>(
+      `${GMAIL_BASE}/labels`,
+      account.accessToken,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          labelListVisibility: "labelShow",
+          messageListVisibility: "show",
+        }),
+      },
+    );
+
+    // A freshly created label is always a user label, regardless of what the
+    // response echoes back.
+    return { id: created.id, name: created.name, type: "user" };
+  },
+
+  async moveToLabel(
+    account: AccountWithTokens,
+    messageIds: string[],
+    labelId: string,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    // "Move" in Gmail = apply the destination label and drop it from the
+    // inbox, in a single batchModify call.
+    await batchModify(account, messageIds, {
+      addLabelIds: [labelId],
+      removeLabelIds: ["INBOX"],
+    });
   },
 
   async getMessage(
@@ -440,86 +567,196 @@ export const googleMailProvider: MailProvider = {
     };
   },
 
+  async applyAction(
+    account: AccountWithTokens,
+    messageIds: string[],
+    action: MailActionType,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    switch (action) {
+      // trash/untrash have no batch endpoint, so fan out one call per id.
+      // These return the modified message resource (which we ignore).
+      case "trash":
+        await Promise.all(
+          messageIds.map((id) =>
+            gfetch(
+              `${GMAIL_BASE}/messages/${encodeURIComponent(id)}/trash`,
+              account.accessToken,
+              { method: "POST" },
+            ),
+          ),
+        );
+        return;
+      case "untrash":
+        await Promise.all(
+          messageIds.map((id) =>
+            gfetch(
+              `${GMAIL_BASE}/messages/${encodeURIComponent(id)}/untrash`,
+              account.accessToken,
+              { method: "POST" },
+            ),
+          ),
+        );
+        return;
+      // Label changes go through batchModify in a single call. It returns 204
+      // with no body, so we use gfetch (not gfetchJson) and discard the result.
+      case "archive":
+        await batchModify(account, messageIds, { removeLabelIds: ["INBOX"] });
+        return;
+      case "markRead":
+        await batchModify(account, messageIds, { removeLabelIds: ["UNREAD"] });
+        return;
+      case "markUnread":
+        await batchModify(account, messageIds, { addLabelIds: ["UNREAD"] });
+        return;
+      case "star":
+        await batchModify(account, messageIds, { addLabelIds: ["STARRED"] });
+        return;
+      case "unstar":
+        await batchModify(account, messageIds, {
+          removeLabelIds: ["STARRED"],
+        });
+        return;
+      default: {
+        // Exhaustiveness check: a new MailActionType must be handled above.
+        const exhaustive: never = action;
+        throw new Error(`Unsupported mail action: ${String(exhaustive)}`);
+      }
+    }
+  },
+
+  async listDrafts(
+    account: AccountWithTokens,
+    limit: number,
+  ): Promise<DraftSummary[]> {
+    const listUrl = `${GMAIL_BASE}/drafts?maxResults=${encodeURIComponent(String(limit))}`;
+    const list = await gfetchJson<{
+      drafts?: Array<{ id: string; message?: { id: string } }>;
+    }>(listUrl, account.accessToken);
+
+    const refs = list.drafts ?? [];
+    if (refs.length === 0) return [];
+
+    const drafts = await mapWithConcurrency(
+      refs,
+      GMAIL_FETCH_CONCURRENCY,
+      async (ref) => {
+        const detailUrl =
+          `${GMAIL_BASE}/drafts/${encodeURIComponent(ref.id)}` +
+          `?format=metadata&metadataHeaders=To&metadataHeaders=Subject`;
+        const draft = await gfetchJson<{ id: string; message: GmailMessage }>(
+          detailUrl,
+          account.accessToken,
+        );
+        const headers = draft.message.payload?.headers;
+        const summary: DraftSummary = {
+          id: draft.id,
+          accountId: account.id,
+          provider: "google",
+          to: parseAddressList(header(headers, "To")),
+          subject: header(headers, "Subject"),
+          snippet: draft.message.snippet ?? "",
+          updatedAt: internalDateToIso(draft.message.internalDate),
+        };
+        return summary;
+      },
+    );
+
+    return drafts;
+  },
+
+  async getDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<DraftContent> {
+    const url = `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}?format=full`;
+    const draft = await gfetchJson<{ id: string; message: GmailMessage }>(
+      url,
+      account.accessToken,
+    );
+
+    const full = toFullMessage(account, draft.message);
+    return {
+      id: draftId,
+      to: full.to,
+      cc: full.cc,
+      subject: full.subject,
+      bodyText: full.bodyText ?? "",
+      bodyHtml: full.bodyHtml,
+    };
+  },
+
+  async createDraft(
+    account: AccountWithTokens,
+    draft: MailDraft,
+    reply?: ReplyContext,
+  ): Promise<string> {
+    const message: { raw: string; threadId?: string } = {
+      raw: buildRawMessage(account, draft, reply),
+    };
+    if (reply?.threadId) {
+      message.threadId = reply.threadId;
+    }
+
+    const created = await gfetchJson<{ id: string }>(
+      `${GMAIL_BASE}/drafts`,
+      account.accessToken,
+      {
+        method: "POST",
+        body: JSON.stringify({ message }),
+      },
+    );
+
+    return created.id;
+  },
+
+  async updateDraft(
+    account: AccountWithTokens,
+    draftId: string,
+    draft: MailDraft,
+  ): Promise<void> {
+    await gfetch(
+      `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          message: { raw: buildRawMessage(account, draft) },
+        }),
+      },
+    );
+  },
+
+  async sendDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    await gfetch(`${GMAIL_BASE}/drafts/send`, account.accessToken, {
+      method: "POST",
+      body: JSON.stringify({ id: draftId }),
+    });
+  },
+
+  async deleteDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    // The drafts.delete endpoint returns 204 with no body, so use gfetch
+    // rather than gfetchJson and discard the response.
+    await gfetch(
+      `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
+  },
+
   async sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
     reply?: ReplyContext,
   ): Promise<void> {
-    const useHtml = typeof draft.bodyHtml === "string" && draft.bodyHtml.length > 0;
-    const bodyContentType = useHtml
-      ? 'text/html; charset="utf-8"'
-      : 'text/plain; charset="utf-8"';
-    const body = useHtml ? (draft.bodyHtml as string) : draft.bodyText;
-
-    const attachments = draft.attachments ?? [];
-    const hasAttachments = attachments.length > 0;
-
-    // Top-level headers, shared by both the single-part and multipart paths.
-    const topHeaders: string[] = [];
-    topHeaders.push(`From: ${account.email}`);
-    topHeaders.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
-    if (draft.cc && draft.cc.length > 0) {
-      topHeaders.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
-    }
-    topHeaders.push(`Subject: ${draft.subject}`);
-    topHeaders.push("MIME-Version: 1.0");
-
-    if (reply?.messageIdHeader) {
-      topHeaders.push(`In-Reply-To: ${reply.messageIdHeader}`);
-      const references = reply.references
-        ? `${reply.references} ${reply.messageIdHeader}`
-        : reply.messageIdHeader;
-      topHeaders.push(`References: ${references}`);
-    }
-
-    let rawMessage: string;
-
-    if (hasAttachments) {
-      // multipart/mixed: a single body part followed by one part per file.
-      const boundary = `==onepane_${randomBytes(16).toString("hex")}==`;
-      topHeaders.push(
-        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-      );
-
-      const segments: string[] = [];
-
-      // Body part.
-      segments.push(
-        [
-          `--${boundary}`,
-          `Content-Type: ${bodyContentType}`,
-          "Content-Transfer-Encoding: 7bit",
-          "",
-          body,
-        ].join("\r\n"),
-      );
-
-      // Attachment parts.
-      for (const att of attachments) {
-        const filename = att.filename || "attachment";
-        const mimeType = att.mimeType || "application/octet-stream";
-        segments.push(
-          [
-            `--${boundary}`,
-            `Content-Type: ${mimeType}; name="${filename}"`,
-            "Content-Transfer-Encoding: base64",
-            `Content-Disposition: attachment; filename="${filename}"`,
-            "",
-            wrapBase64(att.contentBase64),
-          ].join("\r\n"),
-        );
-      }
-
-      // Closing boundary.
-      const bodyBlock = `${segments.join("\r\n")}\r\n--${boundary}--`;
-      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${bodyBlock}`;
-    } else {
-      // Single-part path — unchanged from the original implementation.
-      topHeaders.push(`Content-Type: ${bodyContentType}`);
-      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${body}`;
-    }
-
-    const raw = encodeBase64Url(rawMessage);
+    const raw = buildRawMessage(account, draft, reply);
 
     const payload: { raw: string; threadId?: string } = { raw };
     if (reply?.threadId) {
@@ -532,6 +769,94 @@ export const googleMailProvider: MailProvider = {
     });
   },
 };
+
+/**
+ * Builds an RFC 2822 message from a MailDraft and returns it as URL-safe
+ * base64 (the `raw` field accepted by Gmail's messages.send and drafts
+ * create/update endpoints). Handles both single-part bodies and multipart/
+ * mixed messages carrying attachments, and threads replies via In-Reply-To/
+ * References headers. Shared by sendMessage, createDraft and updateDraft.
+ */
+function buildRawMessage(
+  account: AccountWithTokens,
+  draft: MailDraft,
+  reply?: ReplyContext,
+): string {
+  const useHtml =
+    typeof draft.bodyHtml === "string" && draft.bodyHtml.length > 0;
+  const bodyContentType = useHtml
+    ? 'text/html; charset="utf-8"'
+    : 'text/plain; charset="utf-8"';
+  const body = useHtml ? (draft.bodyHtml as string) : draft.bodyText;
+
+  const attachments = draft.attachments ?? [];
+  const hasAttachments = attachments.length > 0;
+
+  // Top-level headers, shared by both the single-part and multipart paths.
+  const topHeaders: string[] = [];
+  topHeaders.push(`From: ${account.email}`);
+  topHeaders.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
+  if (draft.cc && draft.cc.length > 0) {
+    topHeaders.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
+  }
+  topHeaders.push(`Subject: ${draft.subject}`);
+  topHeaders.push("MIME-Version: 1.0");
+
+  if (reply?.messageIdHeader) {
+    topHeaders.push(`In-Reply-To: ${reply.messageIdHeader}`);
+    const references = reply.references
+      ? `${reply.references} ${reply.messageIdHeader}`
+      : reply.messageIdHeader;
+    topHeaders.push(`References: ${references}`);
+  }
+
+  let rawMessage: string;
+
+  if (hasAttachments) {
+    // multipart/mixed: a single body part followed by one part per file.
+    const boundary = `==onepane_${randomBytes(16).toString("hex")}==`;
+    topHeaders.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+
+    const segments: string[] = [];
+
+    // Body part.
+    segments.push(
+      [
+        `--${boundary}`,
+        `Content-Type: ${bodyContentType}`,
+        "Content-Transfer-Encoding: 7bit",
+        "",
+        body,
+      ].join("\r\n"),
+    );
+
+    // Attachment parts.
+    for (const att of attachments) {
+      const filename = att.filename || "attachment";
+      const mimeType = att.mimeType || "application/octet-stream";
+      segments.push(
+        [
+          `--${boundary}`,
+          `Content-Type: ${mimeType}; name="${filename}"`,
+          "Content-Transfer-Encoding: base64",
+          `Content-Disposition: attachment; filename="${filename}"`,
+          "",
+          wrapBase64(att.contentBase64),
+        ].join("\r\n"),
+      );
+    }
+
+    // Closing boundary.
+    const bodyBlock = `${segments.join("\r\n")}\r\n--${boundary}--`;
+    rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${bodyBlock}`;
+  } else {
+    // Single-part path — unchanged from the original implementation.
+    topHeaders.push(`Content-Type: ${bodyContentType}`);
+    rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${body}`;
+  }
+
+  return encodeBase64Url(rawMessage);
+}
 
 /**
  * Recursively searches a Gmail payload for the part whose body.attachmentId
@@ -555,6 +880,22 @@ function findAttachmentPart(
 /** Renders a MailAddress for an RFC 2822 header value. */
 function formatHeaderAddress(addr: MailAddress): string {
   return addr.name ? `${addr.name} <${addr.email}>` : addr.email;
+}
+
+/**
+ * Adds and/or removes labels on a batch of messages via the Gmail
+ * batchModify endpoint (a single request). batchModify responds with 204 and
+ * no body, so we use gfetch rather than gfetchJson and discard the response.
+ */
+async function batchModify(
+  account: AccountWithTokens,
+  messageIds: string[],
+  labels: { addLabelIds?: string[]; removeLabelIds?: string[] },
+): Promise<void> {
+  await gfetch(`${GMAIL_BASE}/messages/batchModify`, account.accessToken, {
+    method: "POST",
+    body: JSON.stringify({ ids: messageIds, ...labels }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +932,19 @@ interface GoogleEvent {
   attendees?: GoogleEventAttendee[];
   conferenceData?: { entryPoints?: GoogleEventEntryPoint[] };
 }
+
+/** A calendar resource as returned by the calendarList endpoint. */
+interface GoogleCalendarListEntry {
+  id: string;
+  summary?: string;
+  summaryOverride?: string;
+  backgroundColor?: string;
+  primary?: boolean;
+  accessRole?: string;
+}
+
+/** Access roles that allow creating/editing events on a calendar. */
+const EDITABLE_ACCESS_ROLES: ReadonlyArray<string> = ["owner", "writer"];
 
 const VALID_RESPONSES: ReadonlyArray<string> = [
   "needsAction",
@@ -629,6 +983,7 @@ function extractMeetUrl(event: GoogleEvent): string | null {
 function toUnifiedEvent(
   account: AccountWithTokens,
   event: GoogleEvent,
+  calendarId: string,
 ): UnifiedEvent {
   const allDay = Boolean(event.start?.date && !event.start?.dateTime);
   const location = event.location ?? null;
@@ -657,6 +1012,7 @@ function toUnifiedEvent(
   return {
     id: event.id,
     accountId: account.id,
+    calendarId,
     provider: "google",
     title: event.summary ?? "(no title)",
     description: event.description ?? null,
@@ -680,13 +1036,82 @@ function isoToDate(iso: string): string {
   return new Date(iso).toISOString().slice(0, 10);
 }
 
+/**
+ * Builds the Google Calendar event request body from an EventDraft. Shared by
+ * createEvent and updateEvent so the two never diverge in how they translate a
+ * draft (title/description/times/attendees/location/conference) into the API
+ * payload. The conferenceData.createRequest is only meaningful on create; on a
+ * PATCH it is a no-op when the event already has the same conference, and
+ * harmless otherwise, so a single builder is safe for both.
+ */
+function buildEventBody(
+  account: AccountWithTokens,
+  draft: EventDraft,
+): Record<string, unknown> {
+  const start: GoogleEventDateTime = draft.allDay
+    ? { date: isoToDate(draft.start) }
+    : { dateTime: draft.start, timeZone: "UTC" };
+  const end: GoogleEventDateTime = draft.allDay
+    ? { date: isoToDate(draft.end) }
+    : { dateTime: draft.end, timeZone: "UTC" };
+
+  const body: Record<string, unknown> = {
+    summary: draft.title,
+    description: draft.description,
+    start,
+    end,
+    attendees: draft.attendees.map((a) => ({ email: a.email })),
+  };
+
+  if (draft.locationType === "physical" && draft.physicalLocation) {
+    body.location = draft.physicalLocation;
+  } else if (
+    draft.locationType === "conference" &&
+    draft.conferenceType === "google_meet"
+  ) {
+    body.conferenceData = {
+      createRequest: {
+        requestId: `${account.id}-${draft.start}`,
+        conferenceSolutionKey: { type: "hangoutsMeet" },
+      },
+    };
+  }
+
+  return body;
+}
+
 export const googleCalendarProvider: CalendarProvider = {
+  async listCalendars(
+    account: AccountWithTokens,
+  ): Promise<CalendarInfo[]> {
+    const data = await gfetchJson<{ items?: GoogleCalendarListEntry[] }>(
+      `${CALENDAR_BASE}/users/me/calendarList`,
+      account.accessToken,
+    );
+
+    return (data.items ?? [])
+      .filter((c): c is GoogleCalendarListEntry => Boolean(c && c.id))
+      .map((c) => ({
+        id: c.id,
+        accountId: account.id,
+        provider: "google" as const,
+        name: c.summaryOverride ?? c.summary ?? c.id,
+        color: c.backgroundColor ?? null,
+        primary: Boolean(c.primary),
+        canEdit: Boolean(
+          c.accessRole && EDITABLE_ACCESS_ROLES.includes(c.accessRole),
+        ),
+      }));
+  },
+
   async listEvents(
     account: AccountWithTokens,
     range: DateRange,
+    calendarId?: string,
   ): Promise<UnifiedEvent[]> {
+    const calId = calendarId || "primary";
     const url =
-      `${CALENDAR_BASE}/calendars/primary/events` +
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}/events` +
       `?timeMin=${encodeURIComponent(range.start)}` +
       `&timeMax=${encodeURIComponent(range.end)}` +
       `&singleEvents=true&orderBy=startTime&maxResults=250`;
@@ -696,44 +1121,20 @@ export const googleCalendarProvider: CalendarProvider = {
       account.accessToken,
     );
 
-    return (data.items ?? []).map((item) => toUnifiedEvent(account, item));
+    return (data.items ?? []).map((item) =>
+      toUnifiedEvent(account, item, calId),
+    );
   },
 
   async createEvent(
     account: AccountWithTokens,
     draft: EventDraft,
   ): Promise<UnifiedEvent> {
-    const start: GoogleEventDateTime = draft.allDay
-      ? { date: isoToDate(draft.start) }
-      : { dateTime: draft.start, timeZone: "UTC" };
-    const end: GoogleEventDateTime = draft.allDay
-      ? { date: isoToDate(draft.end) }
-      : { dateTime: draft.end, timeZone: "UTC" };
-
-    const body: Record<string, unknown> = {
-      summary: draft.title,
-      description: draft.description,
-      start,
-      end,
-      attendees: draft.attendees.map((a) => ({ email: a.email })),
-    };
-
-    if (draft.locationType === "physical" && draft.physicalLocation) {
-      body.location = draft.physicalLocation;
-    } else if (
-      draft.locationType === "conference" &&
-      draft.conferenceType === "google_meet"
-    ) {
-      body.conferenceData = {
-        createRequest: {
-          requestId: `${account.id}-${draft.start}`,
-          conferenceSolutionKey: { type: "hangoutsMeet" },
-        },
-      };
-    }
+    const calId = draft.calendarId || "primary";
+    const body = buildEventBody(account, draft);
 
     const url =
-      `${CALENDAR_BASE}/calendars/primary/events` +
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}/events` +
       `?conferenceDataVersion=1&sendUpdates=all`;
 
     const created = await gfetchJson<GoogleEvent>(url, account.accessToken, {
@@ -741,6 +1142,76 @@ export const googleCalendarProvider: CalendarProvider = {
       body: JSON.stringify(body),
     });
 
-    return toUnifiedEvent(account, created);
+    return toUnifiedEvent(account, created, calId);
+  },
+
+  async updateEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    draft: EventDraft,
+    calendarId?: string,
+  ): Promise<UnifiedEvent> {
+    const calId = calendarId || draft.calendarId || "primary";
+    const body = buildEventBody(account, draft);
+
+    const url =
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+      `/events/${encodeURIComponent(eventId)}` +
+      `?conferenceDataVersion=1&sendUpdates=all`;
+
+    const updated = await gfetchJson<GoogleEvent>(url, account.accessToken, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+
+    return toUnifiedEvent(account, updated, calId);
+  },
+
+  async deleteEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    calendarId?: string,
+  ): Promise<void> {
+    const calId = calendarId || "primary";
+    // events.delete returns 204 with no body, so use gfetch (not gfetchJson).
+    await gfetch(
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+        `/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
+  },
+
+  async respondToEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    response: AttendeeResponse,
+    calendarId?: string,
+  ): Promise<void> {
+    const calId = calendarId || "primary";
+    const eventUrl =
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+      `/events/${encodeURIComponent(eventId)}`;
+
+    // Get-modify-patch: fetch the current attendees so other attendees' RSVP
+    // statuses are preserved, update (or add) our own, then PATCH the full list.
+    const event = await gfetchJson<GoogleEvent>(eventUrl, account.accessToken);
+
+    const attendees = (event.attendees ?? []).map((a) => ({ ...a }));
+    const ourEmail = account.email.toLowerCase();
+    const existing = attendees.find(
+      (a) => (a.email ?? "").toLowerCase() === ourEmail,
+    );
+
+    if (existing) {
+      existing.responseStatus = response;
+    } else {
+      attendees.push({ email: account.email, responseStatus: response });
+    }
+
+    await gfetch(`${eventUrl}?sendUpdates=all`, account.accessToken, {
+      method: "PATCH",
+      body: JSON.stringify({ attendees }),
+    });
   },
 };

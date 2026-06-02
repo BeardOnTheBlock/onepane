@@ -20,6 +20,9 @@ export interface Conversation {
   unread: boolean;
   /** True if any message in the conversation reports attachments. */
   hasAttachments: boolean;
+  /** All fetched member message ids of the thread, so triage actions can
+   *  target the whole conversation in one call. */
+  messageIds: string[];
 }
 
 function timeOf(iso: string): number {
@@ -49,6 +52,7 @@ export function groupConversations(
         count: 1,
         unread: message.unread,
         hasAttachments: message.hasAttachments,
+        messageIds: [message.id],
       });
       continue;
     }
@@ -56,6 +60,7 @@ export function groupConversations(
     existing.count += 1;
     existing.unread = existing.unread || message.unread;
     existing.hasAttachments = existing.hasAttachments || message.hasAttachments;
+    existing.messageIds.push(message.id);
     if (timeOf(message.date) > timeOf(existing.latest.date)) {
       existing.latest = message;
     }

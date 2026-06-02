@@ -10,12 +10,12 @@ import {
   deleteStoredCredential,
   setStoredCredential,
 } from "@/lib/provider-credentials";
-import type { ProviderId } from "@/lib/types";
+import type { OAuthProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function isProviderId(value: unknown): value is ProviderId {
+function isProviderId(value: unknown): value is OAuthProviderId {
   return typeof value === "string" && (ALL_PROVIDERS as string[]).includes(value);
 }
 

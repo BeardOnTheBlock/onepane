@@ -34,27 +34,39 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { FetchError, postJson } from "@/lib/fetcher";
+import { FetchError, patchJson, postJson } from "@/lib/fetcher";
 import { cn, googleMapsUrl } from "@/lib/utils";
 import type {
   AccountPublic,
+  CalendarInfo,
   ConferenceType,
   CreateEventResponse,
   EventAttendee,
   EventDraft,
   EventLocationType,
+  UnifiedEvent,
 } from "@/lib/types";
 
 interface EventComposerDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   accounts: AccountPublic[];
+  /** All known calendars; the dialog shows the chosen account's editable ones. */
+  calendars?: CalendarInfo[];
   /** Account to pre-select as organiser (defaults to the first account). */
   defaultAccountId?: string;
   /** Day to pre-fill the start time onto (defaults to the next round hour). */
   initialDate?: Date | null;
+  /**
+   * When supplied, the dialog opens in edit mode: every field is prefilled
+   * from the event, the organising account is locked, and submitting PATCHes
+   * the event instead of creating a new one.
+   */
+  editEvent?: UnifiedEvent | null;
   /** Re-fetch the calendar after a successful create. */
   onCreated?: () => void;
+  /** Re-fetch the calendar after a successful edit. */
+  onSaved?: () => void;
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -99,15 +111,28 @@ function conferenceCapability(
   return null;
 }
 
+/** Derives the editor's location segment from an existing event. */
+function locationTypeOf(event: UnifiedEvent): EventLocationType {
+  if (event.conferenceType !== "none") return "conference";
+  if (event.location) return "physical";
+  return "none";
+}
+
 export function EventComposerDialog({
   open,
   onOpenChange,
   accounts,
+  calendars = [],
   defaultAccountId,
   initialDate,
+  editEvent,
   onCreated,
+  onSaved,
 }: EventComposerDialogProps) {
+  const isEdit = Boolean(editEvent);
+
   const [accountId, setAccountId] = React.useState("");
+  const [calendarId, setCalendarId] = React.useState("");
   const [title, setTitle] = React.useState("");
   const [start, setStart] = React.useState("");
   const [end, setEnd] = React.useState("");
@@ -122,19 +147,34 @@ export function EventComposerDialog({
   // (Re)initialise the form whenever the dialog opens.
   React.useEffect(() => {
     if (!open) return;
+    setAttendeeInput("");
+    setSubmitting(false);
+    setAttempted(false);
+    if (editEvent) {
+      setAccountId(editEvent.accountId);
+      setCalendarId(editEvent.calendarId);
+      setTitle(editEvent.title);
+      setStart(toLocalInputValue(new Date(editEvent.start)));
+      setEnd(toLocalInputValue(new Date(editEvent.end)));
+      setAttendees(
+        editEvent.attendees.map((a) => ({ email: a.email, name: a.name })),
+      );
+      setDescription(editEvent.description ?? "");
+      setLocationType(locationTypeOf(editEvent));
+      setAddress(editEvent.location ?? "");
+      return;
+    }
     const s = defaultStart(initialDate);
     const e = addMinutes(s, 60);
     setAccountId(defaultAccountId ?? accounts[0]?.id ?? "");
+    setCalendarId("");
     setTitle("");
     setStart(toLocalInputValue(s));
     setEnd(toLocalInputValue(e));
     setAttendees([]);
-    setAttendeeInput("");
     setDescription("");
     setLocationType("none");
     setAddress("");
-    setSubmitting(false);
-    setAttempted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -142,9 +182,48 @@ export function EventComposerDialog({
   const conference = conferenceCapability(selectedAccount);
   const canHostVideo = conference !== null;
 
+  // Editable calendars belonging to the chosen account, primaries first.
+  const accountCalendars = React.useMemo(() => {
+    return calendars
+      .filter((c) => c.accountId === accountId && c.canEdit)
+      .sort((a, b) => {
+        if (a.primary !== b.primary) return a.primary ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+  }, [calendars, accountId]);
+
+  // In edit mode the calendar is locked; show its name (falling back to a
+  // generic label when the calendar list hasn't loaded or doesn't include it).
+  const editCalendarLabel = React.useMemo(() => {
+    if (!editEvent) return "";
+    const match = calendars.find(
+      (c) => c.accountId === editEvent.accountId && c.id === editEvent.calendarId,
+    );
+    return match?.name ?? "This calendar";
+  }, [calendars, editEvent]);
+
+  // Keep a valid calendar selected: default to the account's primary (or first).
+  // In edit mode we honour the event's own calendar even if it isn't listed.
+  React.useEffect(() => {
+    if (isEdit) return;
+    if (accountCalendars.length === 0) {
+      setCalendarId("");
+      return;
+    }
+    setCalendarId((prev) => {
+      if (prev && accountCalendars.some((c) => c.id === prev)) return prev;
+      const primary = accountCalendars.find((c) => c.primary);
+      return (primary ?? accountCalendars[0]).id;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountId, accountCalendars.length, isEdit]);
+
   // If the organiser switches to an account that can't host video while Video
   // was selected, fall back to "none" so we never submit an invalid draft.
+  // In edit mode the account is locked and the event already owns its meeting,
+  // so we leave the prefilled conference selection intact.
   React.useEffect(() => {
+    if (isEdit) return;
     if (locationType === "conference" && !canHostVideo) {
       setLocationType("none");
     }
@@ -234,6 +313,7 @@ export function EventComposerDialog({
       end: endDate.toISOString(),
       attendees: finalAttendees,
       locationType,
+      ...(calendarId ? { calendarId } : {}),
       ...(description.trim() ? { description: description.trim() } : {}),
       ...(locationType === "physical" ? { physicalLocation: address.trim() } : {}),
       ...(locationType === "conference" && conference
@@ -243,22 +323,37 @@ export function EventComposerDialog({
 
     setSubmitting(true);
     try {
-      await postJson<CreateEventResponse>("/api/calendar/events", {
-        accountId,
-        draft,
-      });
-      toast.success("Event created", {
-        description:
-          finalAttendees.length > 0
-            ? `Invites sent to ${finalAttendees.length} guest${finalAttendees.length === 1 ? "" : "s"}.`
-            : draft.title,
-      });
-      onCreated?.();
+      if (editEvent) {
+        await patchJson<CreateEventResponse>("/api/calendar/events", {
+          accountId,
+          eventId: editEvent.id,
+          draft,
+          calendarId: calendarId || editEvent.calendarId,
+        });
+        toast.success("Event updated", { description: draft.title });
+        onSaved?.();
+      } else {
+        await postJson<CreateEventResponse>("/api/calendar/events", {
+          accountId,
+          draft,
+        });
+        toast.success("Event created", {
+          description:
+            finalAttendees.length > 0
+              ? `Invites sent to ${finalAttendees.length} guest${finalAttendees.length === 1 ? "" : "s"}.`
+              : draft.title,
+        });
+        onCreated?.();
+      }
       onOpenChange(false);
     } catch (err) {
-      const message =
-        err instanceof FetchError ? err.message : "Could not create the event.";
-      toast.error("Failed to create event", { description: message });
+      const fallback = editEvent
+        ? "Could not update the event."
+        : "Could not create the event.";
+      const message = err instanceof FetchError ? err.message : fallback;
+      toast.error(editEvent ? "Failed to update event" : "Failed to create event", {
+        description: message,
+      });
     } finally {
       setSubmitting(false);
     }
@@ -280,31 +375,85 @@ export function EventComposerDialog({
       <DialogContent className="max-h-[92vh] max-w-lg gap-0 overflow-y-auto p-0 scrollbar-thin">
         <form onSubmit={handleSubmit}>
           <DialogHeader className="space-y-1.5 border-b border-border p-6">
-            <DialogTitle>New event</DialogTitle>
+            <DialogTitle>{isEdit ? "Edit event" : "New event"}</DialogTitle>
             <DialogDescription>
-              Send an invite from any connected account.
+              {isEdit
+                ? "Update the details and notify your guests."
+                : "Send an invite from any connected account."}
             </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-5 p-6">
-            {/* Organising account */}
-            <div className="space-y-1.5">
-              <Label htmlFor="composer-account">Organising account</Label>
-              <Select value={accountId} onValueChange={setAccountId}>
-                <SelectTrigger id="composer-account" className="h-10">
-                  <SelectValue placeholder="Choose an account" />
-                </SelectTrigger>
-                <SelectContent>
-                  {accounts.map((a) => (
-                    <SelectItem key={a.id} value={a.id}>
-                      <span className="flex items-center gap-2">
-                        <AccountDot color={a.color} size="sm" />
-                        <span className="truncate">{a.email}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            {/* Organising account + calendar */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="composer-account">Organising account</Label>
+                <Select
+                  value={accountId}
+                  onValueChange={setAccountId}
+                  disabled={isEdit}
+                >
+                  <SelectTrigger id="composer-account" className="h-10">
+                    <SelectValue placeholder="Choose an account" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {accounts.map((a) => (
+                      <SelectItem key={a.id} value={a.id}>
+                        <span className="flex items-center gap-2">
+                          <AccountDot color={a.color} size="sm" />
+                          <span className="truncate">{a.email}</span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="composer-calendar">Calendar</Label>
+                {isEdit ? (
+                  <Input
+                    id="composer-calendar"
+                    value={editCalendarLabel}
+                    readOnly
+                    disabled
+                    className="h-10"
+                  />
+                ) : (
+                  <Select
+                    value={calendarId}
+                    onValueChange={setCalendarId}
+                    disabled={accountCalendars.length === 0}
+                  >
+                    <SelectTrigger id="composer-calendar" className="h-10">
+                      <SelectValue
+                        placeholder={
+                          accountCalendars.length === 0
+                            ? "Default calendar"
+                            : "Choose a calendar"
+                        }
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {accountCalendars.map((c) => (
+                        <SelectItem key={c.id} value={c.id}>
+                          <span className="flex items-center gap-2">
+                            <span
+                              className="h-2.5 w-2.5 shrink-0 rounded-full ring-1 ring-black/5"
+                              style={{
+                                backgroundColor:
+                                  c.color ?? "hsl(var(--muted-foreground))",
+                              }}
+                              aria-hidden="true"
+                            />
+                            <span className="truncate">{c.name}</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
             </div>
 
             {/* Title */}
@@ -532,7 +681,13 @@ export function EventComposerDialog({
             </Button>
             <Button type="submit" disabled={submitting}>
               {submitting && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
-              {submitting ? "Creating…" : "Create event"}
+              {isEdit
+                ? submitting
+                  ? "Saving…"
+                  : "Save changes"
+                : submitting
+                  ? "Creating…"
+                  : "Create event"}
             </Button>
           </DialogFooter>
         </form>
