@@ -13,6 +13,12 @@
     "typecheck": "tsc --noEmit",
     "setup": "prisma generate && prisma db push",
     "db:studio": "prisma studio",
+    "service:install": "bash scripts/service-install.sh",
+    "service:uninstall": "bash scripts/service-uninstall.sh",
+    "service:status": "bash scripts/service-status.sh",
+    "service:restart": "bash scripts/service-restart.sh",
+    "service:rebuild": "bash scripts/service-restart.sh --rebuild",
+    "service:logs": "tail -f \"$HOME/Library/Logs/onepane.log\"",
     "postinstall": "prisma generate"
   },
   "prisma": {

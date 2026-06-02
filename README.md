@@ -114,6 +114,20 @@ local database — no `.env` editing required (though you can use `.env` instead
 prefer). Then hit **Connect**, complete the consent screen, and you're in. You can connect
 just one provider to start, and as many accounts as you like.
 
+## Keep it running
+
+`npm run dev` only serves while the terminal is open. To have OnePane always available
+at <http://localhost:6969> and start automatically at login, install it as a background
+service:
+
+```bash
+npm run service:install      # macOS (launchd): build + run + start at login
+```
+
+Manage it with `npm run service:status`, `service:logs`, `service:restart`,
+`service:rebuild` (after code changes), and `service:uninstall`. Linux (systemd) and
+cross-platform (pm2) instructions are in [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md).
+
 ## Conferencing and locations
 
 How a meeting link is created depends on the account hosting the event:
