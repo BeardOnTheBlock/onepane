@@ -3,15 +3,21 @@
 import * as React from "react";
 import { format, isSameDay } from "date-fns";
 import {
+  Check,
   CalendarClock,
   CheckCircle2,
   CircleHelp,
   ExternalLink,
+  Loader2,
   MapPin,
+  Pencil,
+  Trash2,
   Users,
   Video,
+  X,
   XCircle,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { AccountDot } from "@/components/account-dot";
 import { Button } from "@/components/ui/button";
@@ -22,10 +28,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { del, FetchError, postJson } from "@/lib/fetcher";
 import type {
   AccountPublic,
   AttendeeResponse,
   EventAttendee,
+  OkResponse,
   UnifiedEvent,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -35,6 +43,12 @@ interface EventDetailDialogProps {
   account: AccountPublic | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Open the composer in edit mode for this event. */
+  onEdit?: (event: UnifiedEvent) => void;
+  /** Called after the event is deleted (re-fetch + close happen here). */
+  onDeleted?: () => void;
+  /** Called after an RSVP succeeds (re-fetch the calendar). */
+  onResponded?: () => void;
 }
 
 /** Human label for the provider's web UI deep link. */
@@ -75,6 +89,47 @@ const RESPONSE_META: Record<
   needsAction: { label: "No reply", icon: CircleHelp, className: "text-muted-foreground" },
 };
 
+/** The three actionable RSVP choices, in display order. */
+const RSVP_CHOICES: Array<{
+  response: Exclude<AttendeeResponse, "needsAction">;
+  label: string;
+  icon: React.ElementType;
+}> = [
+  { response: "accepted", label: "Yes", icon: Check },
+  { response: "tentative", label: "Maybe", icon: CircleHelp },
+  { response: "declined", label: "No", icon: X },
+];
+
+/**
+ * The current account's own attendance, when it's a guest on the event and not
+ * the organiser. Returns null when RSVP isn't applicable (organiser, or the
+ * account isn't on the guest list).
+ */
+function selfAttendance(
+  event: UnifiedEvent,
+  account: AccountPublic | undefined,
+): EventAttendee | null {
+  if (!account) return null;
+  const me = account.email.toLowerCase();
+  if (event.organizer && event.organizer.email.toLowerCase() === me) {
+    return null;
+  }
+  return (
+    event.attendees.find((a) => a.email.toLowerCase() === me) ?? null
+  );
+}
+
+/** True when the current account organises the event (can edit/delete it). */
+function isOrganiser(
+  event: UnifiedEvent,
+  account: AccountPublic | undefined,
+): boolean {
+  if (!account) return false;
+  // No organizer recorded → treat the owning account as the organiser.
+  if (!event.organizer) return true;
+  return event.organizer.email.toLowerCase() === account.email.toLowerCase();
+}
+
 function AttendeeRow({ attendee }: { attendee: EventAttendee }) {
   const meta = RESPONSE_META[attendee.responseStatus ?? "needsAction"];
   const Icon = meta.icon;
@@ -107,7 +162,25 @@ export function EventDetailDialog({
   account,
   open,
   onOpenChange,
+  onEdit,
+  onDeleted,
+  onResponded,
 }: EventDetailDialogProps) {
+  const [confirmingDelete, setConfirmingDelete] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [responding, setResponding] = React.useState<AttendeeResponse | null>(
+    null,
+  );
+
+  // Reset the inline confirm + busy state whenever the dialog (re)opens or the
+  // event changes, so a stale "Confirm delete" never carries over.
+  const eventId = event?.id ?? null;
+  React.useEffect(() => {
+    setConfirmingDelete(false);
+    setDeleting(false);
+    setResponding(null);
+  }, [eventId, open]);
+
   if (!event) {
     // Keep the Dialog mounted so close animations still play out.
     return <Dialog open={open} onOpenChange={onOpenChange} />;
@@ -117,6 +190,58 @@ export function EventDetailDialog({
   const accountLabel = account?.email ?? "Unknown account";
   const isConference = event.conferenceType !== "none" && Boolean(event.conferenceUrl);
   const isPhysical = Boolean(event.location);
+
+  const me = selfAttendance(event, account);
+  const canRsvp = me !== null;
+  const canManage = isOrganiser(event, account);
+  const busy = deleting || responding !== null;
+
+  async function handleDelete() {
+    if (!event || !account) return;
+    setDeleting(true);
+    try {
+      const params = new URLSearchParams({
+        accountId: event.accountId,
+        eventId: event.id,
+        calendarId: event.calendarId,
+      });
+      await del<OkResponse>(`/api/calendar/events?${params.toString()}`);
+      toast.success("Event deleted", {
+        description: event.title || "(no title)",
+      });
+      onDeleted?.();
+      onOpenChange(false);
+    } catch (err) {
+      const message =
+        err instanceof FetchError ? err.message : "Could not delete the event.";
+      toast.error("Failed to delete event", { description: message });
+      setDeleting(false);
+      setConfirmingDelete(false);
+    }
+  }
+
+  async function handleRsvp(response: AttendeeResponse) {
+    if (!event) return;
+    setResponding(response);
+    try {
+      await postJson<OkResponse>("/api/calendar/events/respond", {
+        accountId: event.accountId,
+        eventId: event.id,
+        calendarId: event.calendarId,
+        response,
+      });
+      toast.success(`You responded “${RESPONSE_META[response].label}”`, {
+        description: event.title || "(no title)",
+      });
+      onResponded?.();
+    } catch (err) {
+      const message =
+        err instanceof FetchError ? err.message : "Could not send your reply.";
+      toast.error("Failed to RSVP", { description: message });
+    } finally {
+      setResponding(null);
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -146,6 +271,45 @@ export function EventDetailDialog({
               {accountLabel}
             </span>
           </div>
+
+          {/* RSVP — only when this account is a guest (not the organiser) */}
+          {canRsvp && (
+            <div className="rounded-md border border-border bg-muted/30 p-3">
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Going?
+              </p>
+              <div
+                role="group"
+                aria-label="RSVP to this event"
+                className="grid grid-cols-3 gap-2"
+              >
+                {RSVP_CHOICES.map((choice) => {
+                  const Icon = choice.icon;
+                  const active = me?.responseStatus === choice.response;
+                  const isBusy = responding === choice.response;
+                  return (
+                    <Button
+                      key={choice.response}
+                      type="button"
+                      size="sm"
+                      variant={active ? "default" : "outline"}
+                      disabled={busy}
+                      aria-pressed={active}
+                      onClick={() => handleRsvp(choice.response)}
+                      className="h-9"
+                    >
+                      {isBusy ? (
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Icon className="h-4 w-4" aria-hidden="true" />
+                      )}
+                      <span className="truncate">{choice.label}</span>
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Location / conference */}
           {(isConference || isPhysical) && (
@@ -209,17 +373,77 @@ export function EventDetailDialog({
             </div>
           )}
 
-          {/* Open in provider */}
-          {event.htmlLink && (
-            <div className="flex justify-end border-t border-border pt-4">
+          {/* Actions */}
+          <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
+            {event.htmlLink && (
               <Button asChild variant="outline" size="sm">
                 <a href={event.htmlLink} target="_blank" rel="noreferrer">
                   <ExternalLink className="h-4 w-4" aria-hidden="true" />
-                  Open in {providerCalendarLabel(event.provider)}
+                  <span className="hidden sm:inline">
+                    Open in {providerCalendarLabel(event.provider)}
+                  </span>
+                  <span className="sm:hidden">Open</span>
                 </a>
               </Button>
-            </div>
-          )}
+            )}
+
+            {canManage && (
+              <div className="ml-auto flex items-center gap-2">
+                {confirmingDelete ? (
+                  <>
+                    <span className="text-xs text-muted-foreground">
+                      Delete this event?
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={deleting}
+                      onClick={() => setConfirmingDelete(false)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      disabled={deleting}
+                      onClick={handleDelete}
+                    >
+                      {deleting && (
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      )}
+                      Delete
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => onEdit?.(event)}
+                    >
+                      <Pencil className="h-4 w-4" aria-hidden="true" />
+                      Edit
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => setConfirmingDelete(true)}
+                      className="text-destructive hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
+                      Delete
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </DialogContent>
     </Dialog>

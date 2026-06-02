@@ -13,6 +13,8 @@ import { googleMapsUrl } from "@/lib/utils";
 import type {
   AccountWithTokens,
   AttachmentMeta,
+  AttendeeResponse,
+  CalendarInfo,
   CalendarProvider,
   ConferenceType,
   DateRange,
@@ -902,6 +904,19 @@ interface GoogleEvent {
   conferenceData?: { entryPoints?: GoogleEventEntryPoint[] };
 }
 
+/** A calendar resource as returned by the calendarList endpoint. */
+interface GoogleCalendarListEntry {
+  id: string;
+  summary?: string;
+  summaryOverride?: string;
+  backgroundColor?: string;
+  primary?: boolean;
+  accessRole?: string;
+}
+
+/** Access roles that allow creating/editing events on a calendar. */
+const EDITABLE_ACCESS_ROLES: ReadonlyArray<string> = ["owner", "writer"];
+
 const VALID_RESPONSES: ReadonlyArray<string> = [
   "needsAction",
   "accepted",
@@ -939,6 +954,7 @@ function extractMeetUrl(event: GoogleEvent): string | null {
 function toUnifiedEvent(
   account: AccountWithTokens,
   event: GoogleEvent,
+  calendarId: string,
 ): UnifiedEvent {
   const allDay = Boolean(event.start?.date && !event.start?.dateTime);
   const location = event.location ?? null;
@@ -967,6 +983,7 @@ function toUnifiedEvent(
   return {
     id: event.id,
     accountId: account.id,
+    calendarId,
     provider: "google",
     title: event.summary ?? "(no title)",
     description: event.description ?? null,
@@ -990,13 +1007,82 @@ function isoToDate(iso: string): string {
   return new Date(iso).toISOString().slice(0, 10);
 }
 
+/**
+ * Builds the Google Calendar event request body from an EventDraft. Shared by
+ * createEvent and updateEvent so the two never diverge in how they translate a
+ * draft (title/description/times/attendees/location/conference) into the API
+ * payload. The conferenceData.createRequest is only meaningful on create; on a
+ * PATCH it is a no-op when the event already has the same conference, and
+ * harmless otherwise, so a single builder is safe for both.
+ */
+function buildEventBody(
+  account: AccountWithTokens,
+  draft: EventDraft,
+): Record<string, unknown> {
+  const start: GoogleEventDateTime = draft.allDay
+    ? { date: isoToDate(draft.start) }
+    : { dateTime: draft.start, timeZone: "UTC" };
+  const end: GoogleEventDateTime = draft.allDay
+    ? { date: isoToDate(draft.end) }
+    : { dateTime: draft.end, timeZone: "UTC" };
+
+  const body: Record<string, unknown> = {
+    summary: draft.title,
+    description: draft.description,
+    start,
+    end,
+    attendees: draft.attendees.map((a) => ({ email: a.email })),
+  };
+
+  if (draft.locationType === "physical" && draft.physicalLocation) {
+    body.location = draft.physicalLocation;
+  } else if (
+    draft.locationType === "conference" &&
+    draft.conferenceType === "google_meet"
+  ) {
+    body.conferenceData = {
+      createRequest: {
+        requestId: `${account.id}-${draft.start}`,
+        conferenceSolutionKey: { type: "hangoutsMeet" },
+      },
+    };
+  }
+
+  return body;
+}
+
 export const googleCalendarProvider: CalendarProvider = {
+  async listCalendars(
+    account: AccountWithTokens,
+  ): Promise<CalendarInfo[]> {
+    const data = await gfetchJson<{ items?: GoogleCalendarListEntry[] }>(
+      `${CALENDAR_BASE}/users/me/calendarList`,
+      account.accessToken,
+    );
+
+    return (data.items ?? [])
+      .filter((c): c is GoogleCalendarListEntry => Boolean(c && c.id))
+      .map((c) => ({
+        id: c.id,
+        accountId: account.id,
+        provider: "google" as const,
+        name: c.summaryOverride ?? c.summary ?? c.id,
+        color: c.backgroundColor ?? null,
+        primary: Boolean(c.primary),
+        canEdit: Boolean(
+          c.accessRole && EDITABLE_ACCESS_ROLES.includes(c.accessRole),
+        ),
+      }));
+  },
+
   async listEvents(
     account: AccountWithTokens,
     range: DateRange,
+    calendarId?: string,
   ): Promise<UnifiedEvent[]> {
+    const calId = calendarId || "primary";
     const url =
-      `${CALENDAR_BASE}/calendars/primary/events` +
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}/events` +
       `?timeMin=${encodeURIComponent(range.start)}` +
       `&timeMax=${encodeURIComponent(range.end)}` +
       `&singleEvents=true&orderBy=startTime&maxResults=250`;
@@ -1006,44 +1092,20 @@ export const googleCalendarProvider: CalendarProvider = {
       account.accessToken,
     );
 
-    return (data.items ?? []).map((item) => toUnifiedEvent(account, item));
+    return (data.items ?? []).map((item) =>
+      toUnifiedEvent(account, item, calId),
+    );
   },
 
   async createEvent(
     account: AccountWithTokens,
     draft: EventDraft,
   ): Promise<UnifiedEvent> {
-    const start: GoogleEventDateTime = draft.allDay
-      ? { date: isoToDate(draft.start) }
-      : { dateTime: draft.start, timeZone: "UTC" };
-    const end: GoogleEventDateTime = draft.allDay
-      ? { date: isoToDate(draft.end) }
-      : { dateTime: draft.end, timeZone: "UTC" };
-
-    const body: Record<string, unknown> = {
-      summary: draft.title,
-      description: draft.description,
-      start,
-      end,
-      attendees: draft.attendees.map((a) => ({ email: a.email })),
-    };
-
-    if (draft.locationType === "physical" && draft.physicalLocation) {
-      body.location = draft.physicalLocation;
-    } else if (
-      draft.locationType === "conference" &&
-      draft.conferenceType === "google_meet"
-    ) {
-      body.conferenceData = {
-        createRequest: {
-          requestId: `${account.id}-${draft.start}`,
-          conferenceSolutionKey: { type: "hangoutsMeet" },
-        },
-      };
-    }
+    const calId = draft.calendarId || "primary";
+    const body = buildEventBody(account, draft);
 
     const url =
-      `${CALENDAR_BASE}/calendars/primary/events` +
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}/events` +
       `?conferenceDataVersion=1&sendUpdates=all`;
 
     const created = await gfetchJson<GoogleEvent>(url, account.accessToken, {
@@ -1051,6 +1113,76 @@ export const googleCalendarProvider: CalendarProvider = {
       body: JSON.stringify(body),
     });
 
-    return toUnifiedEvent(account, created);
+    return toUnifiedEvent(account, created, calId);
+  },
+
+  async updateEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    draft: EventDraft,
+    calendarId?: string,
+  ): Promise<UnifiedEvent> {
+    const calId = calendarId || draft.calendarId || "primary";
+    const body = buildEventBody(account, draft);
+
+    const url =
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+      `/events/${encodeURIComponent(eventId)}` +
+      `?conferenceDataVersion=1&sendUpdates=all`;
+
+    const updated = await gfetchJson<GoogleEvent>(url, account.accessToken, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+
+    return toUnifiedEvent(account, updated, calId);
+  },
+
+  async deleteEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    calendarId?: string,
+  ): Promise<void> {
+    const calId = calendarId || "primary";
+    // events.delete returns 204 with no body, so use gfetch (not gfetchJson).
+    await gfetch(
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+        `/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
+  },
+
+  async respondToEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    response: AttendeeResponse,
+    calendarId?: string,
+  ): Promise<void> {
+    const calId = calendarId || "primary";
+    const eventUrl =
+      `${CALENDAR_BASE}/calendars/${encodeURIComponent(calId)}` +
+      `/events/${encodeURIComponent(eventId)}`;
+
+    // Get-modify-patch: fetch the current attendees so other attendees' RSVP
+    // statuses are preserved, update (or add) our own, then PATCH the full list.
+    const event = await gfetchJson<GoogleEvent>(eventUrl, account.accessToken);
+
+    const attendees = (event.attendees ?? []).map((a) => ({ ...a }));
+    const ourEmail = account.email.toLowerCase();
+    const existing = attendees.find(
+      (a) => (a.email ?? "").toLowerCase() === ourEmail,
+    );
+
+    if (existing) {
+      existing.responseStatus = response;
+    } else {
+      attendees.push({ email: account.email, responseStatus: response });
+    }
+
+    await gfetch(`${eventUrl}?sendUpdates=all`, account.accessToken, {
+      method: "PATCH",
+      body: JSON.stringify({ attendees }),
+    });
   },
 };
