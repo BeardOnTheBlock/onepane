@@ -22,6 +22,7 @@ import type {
   MailActionType,
   MailAddress,
   MailDraft,
+  MailLabel,
   MailProvider,
   ReplyContext,
   UnifiedEvent,
@@ -146,6 +147,14 @@ interface GmailMessage {
   snippet?: string;
   internalDate?: string;
   payload?: GmailPart;
+}
+
+/** A Gmail label resource as returned by the /labels endpoints. */
+interface GmailLabel {
+  id: string;
+  name: string;
+  /** Gmail already classifies labels as "system" or "user". */
+  type?: "system" | "user";
 }
 
 /** Case-insensitive header lookup; returns the first matching value or "". */
@@ -281,6 +290,19 @@ function walkParts(part: GmailPart | undefined, acc: WalkResult): void {
 const METADATA_HEADERS =
   "metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date";
 
+/**
+ * Maps a Gmail label resource into the shared MailLabel contract. Gmail's
+ * `type` is already "system" | "user"; anything missing/unexpected is treated
+ * as a user label (the safe default — user labels are mutable/movable).
+ */
+function toMailLabel(label: GmailLabel): MailLabel {
+  return {
+    id: label.id,
+    name: label.name,
+    type: label.type === "system" ? "system" : "user",
+  };
+}
+
 function toUnifiedMessage(
   account: AccountWithTokens,
   msg: GmailMessage,
@@ -346,16 +368,32 @@ export const googleMailProvider: MailProvider = {
     account: AccountWithTokens,
     limit: number,
     query?: string,
+    labelId?: string,
   ): Promise<UnifiedMessage[]> {
-    // A non-empty query performs a full-text mailbox search (Gmail search
-    // syntax); otherwise we list the inbox exactly as before.
-    const q = typeof query === "string" && query.trim().length > 0
-      ? query
-      : "in:inbox";
+    // Build the message-list query string. Four cases:
+    //   labelId only      -> labelIds={labelId}  (the label/folder listing;
+    //                        deliberately NO q=in:inbox so we list that label)
+    //   query only        -> q={query}           (full-text Gmail search)
+    //   labelId AND query -> labelIds + q         (search scoped to the label)
+    //   neither           -> q=in:inbox           (default inbox listing)
+    const hasLabel = typeof labelId === "string" && labelId.trim().length > 0;
+    const hasQuery = typeof query === "string" && query.trim().length > 0;
 
-    const listUrl =
-      `${GMAIL_BASE}/messages?maxResults=${encodeURIComponent(String(limit))}` +
-      `&q=${encodeURIComponent(q)}`;
+    const params: string[] = [
+      `maxResults=${encodeURIComponent(String(limit))}`,
+    ];
+    if (hasLabel) {
+      params.push(`labelIds=${encodeURIComponent(labelId as string)}`);
+      if (hasQuery) {
+        params.push(`q=${encodeURIComponent(query as string)}`);
+      }
+    } else if (hasQuery) {
+      params.push(`q=${encodeURIComponent(query as string)}`);
+    } else {
+      params.push(`q=${encodeURIComponent("in:inbox")}`);
+    }
+
+    const listUrl = `${GMAIL_BASE}/messages?${params.join("&")}`;
 
     const list = await gfetchJson<{
       messages?: Array<{ id: string; threadId: string }>;
@@ -378,6 +416,63 @@ export const googleMailProvider: MailProvider = {
     );
 
     return messages;
+  },
+
+  async listLabels(account: AccountWithTokens): Promise<MailLabel[]> {
+    const data = await gfetchJson<{ labels?: GmailLabel[] }>(
+      `${GMAIL_BASE}/labels`,
+      account.accessToken,
+    );
+
+    const labels = (data.labels ?? [])
+      .filter((l): l is GmailLabel => Boolean(l && l.id && l.name))
+      .map(toMailLabel);
+
+    // System labels first, then user labels; alphabetical (case-insensitive)
+    // within each group for a stable, readable ordering.
+    labels.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "system" ? -1 : 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+
+    return labels;
+  },
+
+  async createLabel(
+    account: AccountWithTokens,
+    name: string,
+  ): Promise<MailLabel> {
+    const created = await gfetchJson<GmailLabel>(
+      `${GMAIL_BASE}/labels`,
+      account.accessToken,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          labelListVisibility: "labelShow",
+          messageListVisibility: "show",
+        }),
+      },
+    );
+
+    // A freshly created label is always a user label, regardless of what the
+    // response echoes back.
+    return { id: created.id, name: created.name, type: "user" };
+  },
+
+  async moveToLabel(
+    account: AccountWithTokens,
+    messageIds: string[],
+    labelId: string,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    // "Move" in Gmail = apply the destination label and drop it from the
+    // inbox, in a single batchModify call.
+    await batchModify(account, messageIds, {
+      addLabelIds: [labelId],
+      removeLabelIds: ["INBOX"],
+    });
   },
 
   async getMessage(

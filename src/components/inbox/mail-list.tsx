@@ -21,9 +21,14 @@ export interface MailListProps {
   selectedKey: string | null;
   /** The active search term, used for the header label and empty-state copy. */
   query: string;
+  /** Label id of the current single-account view (hidden from the move menu). */
+  currentLabelId?: string | null;
   onSelect: (conversation: Conversation) => void;
   /** Apply a triage action to a target set of messages. */
   onAction: (target: ActionTarget, action: MailActionType) => void;
+  /** Called after a conversation is moved to a label/folder, so the page can
+   *  optimistically drop it from this view. Absent disables the move control. */
+  onMoved?: (target: ActionTarget) => void;
 }
 
 /** A single placeholder row shown while messages load. */
@@ -63,8 +68,10 @@ export function MailList({
   isLoading,
   selectedKey,
   query,
+  currentLabelId,
   onSelect,
   onAction,
+  onMoved,
 }: MailListProps) {
   const searching = query.trim().length > 0;
 
@@ -110,8 +117,10 @@ export function MailList({
                 conversation={conversation}
                 account={accountById(accounts, conversation.accountId)}
                 selected={selectedKey === conversation.key}
+                currentLabelId={currentLabelId}
                 onSelect={onSelect}
                 onAction={onAction}
+                onMoved={onMoved}
               />
             </li>
           ))}

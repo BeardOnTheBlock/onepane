@@ -18,13 +18,14 @@ import {
   groupConversations,
   type Conversation,
 } from "@/components/inbox/conversations";
+import { LabelFilter } from "@/components/inbox/label-filter";
 import { MailList } from "@/components/inbox/mail-list";
 import { MailReader, type ReaderSelection } from "@/components/inbox/mail-reader";
 import { SearchInput } from "@/components/inbox/search-input";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useAccounts } from "@/hooks/use-accounts";
+import { accountById, useAccounts } from "@/hooks/use-accounts";
 import {
   useMailActions,
   type ActionTarget,
@@ -36,22 +37,46 @@ import type { AccountError, MailListResponse, UnifiedMessage } from "@/lib/types
 const PAGE_SIZE = 25;
 const SEARCH_DEBOUNCE_MS = 350;
 
-/** Stable key for the message list given the account filter and search term. */
-function mailKey(accountId: string, query: string): string {
+/**
+ * Stable key for the message list given the account filter, search term, and
+ * (single-account only) the selected label/folder. `labelId` is ignored for
+ * "all accounts" since labels are inherently per-account.
+ */
+function mailKey(
+  accountId: string,
+  query: string,
+  labelId: string | null,
+): string {
   const base = `/api/mail?accountId=${encodeURIComponent(
     accountId,
   )}&limit=${PAGE_SIZE}`;
   const q = query.trim();
-  return q ? `${base}&q=${encodeURIComponent(q)}` : base;
+  let key = q ? `${base}&q=${encodeURIComponent(q)}` : base;
+  if (accountId !== ALL_ACCOUNTS && labelId) {
+    key += `&labelId=${encodeURIComponent(labelId)}`;
+  }
+  return key;
 }
 
 export default function InboxPage() {
   const { accounts, isLoading: accountsLoading } = useAccounts();
 
   const [filter, setFilter] = React.useState<string>(ALL_ACCOUNTS);
+  const [labelId, setLabelId] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
   const [debouncedQuery, setDebouncedQuery] = React.useState("");
   const [selected, setSelected] = React.useState<ReaderSelection | null>(null);
+
+  // The single account being viewed, if any (labels are per-account).
+  const singleAccount =
+    filter === ALL_ACCOUNTS ? undefined : accountById(accounts, filter);
+
+  // Changing the account filter clears any label selection: labels belong to a
+  // specific account, and "all accounts" has no label view at all.
+  const handleFilterChange = React.useCallback((next: string) => {
+    setFilter(next);
+    setLabelId(null);
+  }, []);
 
   const [composeOpen, setComposeOpen] = React.useState(false);
   const [prefill, setPrefill] = React.useState<ComposePrefill | undefined>();
@@ -67,7 +92,9 @@ export default function InboxPage() {
 
   const { data, error, isLoading, isValidating, mutate } =
     useSWR<MailListResponse>(
-      accounts.length > 0 ? mailKey(filter, debouncedQuery) : null,
+      accounts.length > 0
+        ? mailKey(filter, debouncedQuery, labelId)
+        : null,
       fetcher,
       { revalidateOnFocus: false },
     );
@@ -141,6 +168,26 @@ export default function InboxPage() {
     onRemoved: handleRemoved,
   });
 
+  // After a successful "Move to…", optimistically drop the conversation from the
+  // current view (it has left this label/inbox), and clear the reader selection
+  // if it was showing it. The move-to menu owns the network call + toast.
+  const handleMoved = React.useCallback(
+    (target: ActionTarget) => {
+      const ids = new Set(target.messageIds);
+      void mutate(
+        (current) => ({
+          messages: (current?.messages ?? []).filter(
+            (m) => !(m.accountId === target.accountId && ids.has(m.id)),
+          ),
+          errors: current?.errors ?? [],
+        }),
+        { revalidate: false },
+      );
+      handleRemoved(target);
+    },
+    [mutate, handleRemoved],
+  );
+
   const handleSelect = React.useCallback((conversation: Conversation) => {
     setSelected({
       accountId: conversation.accountId,
@@ -213,9 +260,20 @@ export default function InboxPage() {
           <AccountFilter
             accounts={accounts}
             value={filter}
-            onChange={setFilter}
+            onChange={handleFilterChange}
           />
         )}
+
+        {/* Label/folder filter — only for a single account (labels are
+            per-account). Renders as a natural second row under the accounts. */}
+        {!accountsLoading && singleAccount ? (
+          <LabelFilter
+            accountId={singleAccount.id}
+            provider={singleAccount.provider}
+            value={labelId}
+            onChange={setLabelId}
+          />
+        ) : null}
       </div>
 
       {/* Two-pane (stacks on small screens) */}
@@ -235,8 +293,10 @@ export default function InboxPage() {
             isLoading={isLoading || accountsLoading}
             selectedKey={selectedKey}
             query={debouncedQuery}
+            currentLabelId={singleAccount ? labelId : null}
             onSelect={handleSelect}
             onAction={applyAction}
+            onMoved={handleMoved}
           />
         </section>
 

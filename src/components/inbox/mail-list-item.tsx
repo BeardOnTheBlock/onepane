@@ -4,6 +4,7 @@ import * as React from "react";
 import { Archive, Paperclip, Star, Trash2 } from "lucide-react";
 import { formatDistanceToNowStrict } from "date-fns";
 
+import { MoveToMenu } from "@/components/inbox/move-to-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,9 +22,14 @@ export interface MailListItemProps {
   /** The account the conversation belongs to, for the colour stripe (may be absent). */
   account: AccountPublic | undefined;
   selected: boolean;
+  /** Label id of the current view, hidden from the row's move menu. */
+  currentLabelId?: string | null;
   onSelect: (conversation: Conversation) => void;
   /** Apply a triage action to a target set of messages. */
   onAction: (target: ActionTarget, action: MailActionType) => void;
+  /** Called after this conversation is moved to a label/folder. When absent (or
+   *  the account is unknown) the row shows no move control. */
+  onMoved?: (target: ActionTarget) => void;
 }
 
 /** Compact relative time, e.g. "3h", "2d". Falls back gracefully on bad dates. */
@@ -43,8 +49,10 @@ function MailListItemComponent({
   conversation,
   account,
   selected,
+  currentLabelId,
   onSelect,
   onAction,
+  onMoved,
 }: MailListItemProps) {
   const { latest, count, unread, hasAttachments } = conversation;
   const senderLabel = latest.from.name?.trim() || latest.from.email;
@@ -81,6 +89,14 @@ function MailListItemComponent({
     },
     [onAction, target, starred],
   );
+
+  const handleMoved = React.useCallback(() => {
+    onMoved?.(target);
+  }, [onMoved, target]);
+
+  // Offer the move control only when the page wired up `onMoved` (single-account
+  // view) and we know the provider (to label it folder vs label correctly).
+  const canMove = Boolean(onMoved) && account !== undefined;
 
   return (
     <div
@@ -177,6 +193,18 @@ function MailListItemComponent({
           buttons) and stops propagation so it never opens the conversation.
           Star is always visible; Archive/Delete reveal on hover/focus. */}
       <div className="pointer-events-none absolute right-2 top-1.5 flex items-center gap-0.5">
+        {canMove && account ? (
+          <MoveToMenu
+            accountId={conversation.accountId}
+            provider={account.provider}
+            messageIds={conversation.messageIds}
+            currentLabelId={currentLabelId}
+            onMoved={handleMoved}
+            size="sm"
+            className="pointer-events-auto opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100"
+          />
+        ) : null}
+
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

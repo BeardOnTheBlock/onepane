@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Archive, Mail, MailOpen, Star, Trash2 } from "lucide-react";
 
+import { MoveToMenu } from "@/components/inbox/move-to-menu";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -10,7 +11,19 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { MailActionType } from "@/lib/types";
+import type { MailActionType, ProviderId } from "@/lib/types";
+
+/** Context needed to offer a "Move to…" control for the target conversation. */
+export interface MoveContext {
+  accountId: string;
+  provider: ProviderId;
+  /** Every message id in the target conversation. */
+  messageIds: string[];
+  /** The label id of the current view, if any (hidden from the move menu). */
+  currentLabelId?: string | null;
+  /** Called after a successful move so the parent can drop the conversation. */
+  onMoved?: () => void;
+}
 
 export interface MessageActionsProps {
   /** Current unread state of the target — toggles the read/unread control. */
@@ -19,6 +32,8 @@ export interface MessageActionsProps {
   starred: boolean;
   /** Invoked with the chosen action; the parent handles the optimistic update. */
   onAction: (action: MailActionType) => void;
+  /** When supplied, renders a "Move to…" control for the target conversation. */
+  move?: MoveContext;
   /** Disables every control (e.g. while the target is loading). */
   disabled?: boolean;
   /** Button size — "icon" (default) for headers, "sm" for compact rows. */
@@ -82,6 +97,7 @@ function MessageActionsComponent({
   unread,
   starred,
   onAction,
+  move,
   disabled,
   size = "icon",
   revealOnHover = false,
@@ -117,6 +133,18 @@ function MessageActionsComponent({
       >
         <Trash2 className={iconSize} aria-hidden="true" />
       </ActionButton>
+
+      {move ? (
+        <MoveToMenu
+          accountId={move.accountId}
+          provider={move.provider}
+          messageIds={move.messageIds}
+          currentLabelId={move.currentLabelId}
+          onMoved={move.onMoved}
+          disabled={disabled}
+          size={size}
+        />
+      ) : null}
 
       <ActionButton
         label={unread ? "Mark as read" : "Mark as unread"}
