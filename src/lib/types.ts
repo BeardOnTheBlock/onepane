@@ -192,10 +192,26 @@ export interface EventAttendee {
 
 export type ConferenceType = "none" | "google_meet" | "ms_teams";
 
+/** One of an account's calendars. */
+export interface CalendarInfo {
+  id: string;
+  accountId: string;
+  provider: ProviderId;
+  name: string;
+  /** Hex colour from the provider, if any. */
+  color: string | null;
+  /** The account's default/primary calendar. */
+  primary: boolean;
+  /** Whether the user can create/edit events on it (owner/writer). */
+  canEdit: boolean;
+}
+
 /** A calendar event as shown in the unified calendar. */
 export interface UnifiedEvent {
   id: string;
   accountId: string;
+  /** The calendar this event belongs to (needed to edit/delete it). */
+  calendarId: string;
   provider: ProviderId;
   title: string;
   description: string | null;
@@ -231,6 +247,8 @@ export interface EventDraft {
   physicalLocation?: string;
   /** Required when locationType === "conference". */
   conferenceType?: ConferenceType;
+  /** Which calendar to create/update the event in (defaults to primary). */
+  calendarId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,14 +329,39 @@ export interface MailProvider {
 }
 
 export interface CalendarProvider {
+  /** Lists the account's calendars. */
+  listCalendars(account: AccountWithTokens): Promise<CalendarInfo[]>;
+  /** Lists events in a range. When calendarId is omitted, uses the primary calendar. */
   listEvents(
     account: AccountWithTokens,
     range: DateRange,
+    calendarId?: string,
   ): Promise<UnifiedEvent[]>;
+  /** Creates an event (in draft.calendarId, or the primary calendar). */
   createEvent(
     account: AccountWithTokens,
     draft: EventDraft,
   ): Promise<UnifiedEvent>;
+  /** Updates an existing event. */
+  updateEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    draft: EventDraft,
+    calendarId?: string,
+  ): Promise<UnifiedEvent>;
+  /** Deletes an event (cancels + notifies attendees). */
+  deleteEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    calendarId?: string,
+  ): Promise<void>;
+  /** RSVPs to an invitation (accepted / declined / tentative). */
+  respondToEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    response: AttendeeResponse,
+    calendarId?: string,
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +412,11 @@ export interface CreateDraftResponse {
 
 export interface CalendarListResponse {
   events: UnifiedEvent[];
+  errors: AccountError[];
+}
+
+export interface CalendarsResponse {
+  calendars: CalendarInfo[];
   errors: AccountError[];
 }
 

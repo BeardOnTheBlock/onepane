@@ -31,6 +31,8 @@ interface CalendarToolbarProps {
   onNewEvent: () => void;
   /** Disable "New event" when there are no accounts to organise from. */
   canCreate: boolean;
+  /** Optional "Calendars" visibility control, rendered beside the filter. */
+  calendarPicker?: React.ReactNode;
 }
 
 export function CalendarToolbar({
@@ -45,6 +47,7 @@ export function CalendarToolbar({
   onAccountChange,
   onNewEvent,
   canCreate,
+  calendarPicker,
 }: CalendarToolbarProps) {
   return (
     <div className="flex flex-col gap-3 border-b border-border px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
@@ -104,6 +107,8 @@ export function CalendarToolbar({
             ))}
           </SelectContent>
         </Select>
+
+        {calendarPicker}
 
         <Tabs
           value={view}

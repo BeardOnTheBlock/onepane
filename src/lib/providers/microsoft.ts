@@ -14,6 +14,7 @@ import type {
   AccountWithTokens,
   AttachmentMeta,
   AttendeeResponse,
+  CalendarInfo,
   CalendarProvider,
   ConferenceType,
   DateRange,
@@ -162,6 +163,16 @@ interface GraphMailFolder {
   /** Present on modern tenants for built-in folders (e.g. "inbox", "archive");
    *  may be absent on older tenants, so we also match well-known names. */
   wellKnownName?: string | null;
+}
+
+interface GraphCalendar {
+  id?: string | null;
+  name?: string | null;
+  /** Graph returns a named colour enum (e.g. "auto", "lightBlue"), not a hex
+   *  value, so we map it to null and let the UI assign colours. */
+  color?: string | null;
+  isDefaultCalendar?: boolean | null;
+  canEdit?: boolean | null;
 }
 
 interface GraphList<T> {
@@ -346,8 +357,16 @@ function mapAttendeeResponse(
   }
 }
 
-/** Map a Graph event to the unified calendar shape. */
-function mapEvent(account: AccountWithTokens, e: GraphEvent): UnifiedEvent {
+/**
+ * Map a Graph event to the unified calendar shape. `calendarId` records which
+ * calendar the event was listed from (or created/updated in); it is "" when
+ * listing the default calendarView, which doesn't expose a calendar id.
+ */
+function mapEvent(
+  account: AccountWithTokens,
+  e: GraphEvent,
+  calendarId: string,
+): UnifiedEvent {
   const locationName = e.location?.displayName || null;
 
   const isOnline = Boolean(e.isOnlineMeeting) || Boolean(e.onlineMeeting?.joinUrl);
@@ -369,6 +388,7 @@ function mapEvent(account: AccountWithTokens, e: GraphEvent): UnifiedEvent {
   return {
     id: e.id,
     accountId: account.id,
+    calendarId,
     provider: "microsoft",
     title: e.subject ?? "",
     description: e.bodyPreview || null,
@@ -400,6 +420,49 @@ function toGraphLocalUtc(iso: string): string {
   const minutes = pad(d.getUTCMinutes());
   const seconds = pad(d.getUTCSeconds());
   return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+}
+
+/**
+ * Build the Graph event body used to create or update an event. Times are sent
+ * as local-clock UTC paired with an explicit "UTC" timeZone. Location and
+ * conference are mutually exclusive, mirroring EventLocationType. Shared by
+ * createEvent (POST) and updateEvent (PATCH) so both send identical fields.
+ */
+function toGraphEventBody(draft: EventDraft): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    subject: draft.title,
+    body: {
+      contentType: "HTML",
+      content: draft.description ?? "",
+    },
+    start: {
+      dateTime: toGraphLocalUtc(draft.start),
+      timeZone: "UTC",
+    },
+    end: {
+      dateTime: toGraphLocalUtc(draft.end),
+      timeZone: "UTC",
+    },
+    isAllDay: Boolean(draft.allDay),
+    attendees: draft.attendees.map((a) => ({
+      emailAddress: a.name
+        ? { address: a.email, name: a.name }
+        : { address: a.email },
+      type: "required",
+    })),
+  };
+
+  if (draft.locationType === "physical" && draft.physicalLocation) {
+    payload.location = { displayName: draft.physicalLocation };
+  } else if (
+    draft.locationType === "conference" &&
+    draft.conferenceType === "ms_teams"
+  ) {
+    payload.isOnlineMeeting = true;
+    payload.onlineMeetingProvider = "teamsForBusiness";
+  }
+
+  return payload;
 }
 
 // ---------------------------------------------------------------------------
@@ -831,14 +894,46 @@ export const microsoftMailProvider: MailProvider = {
 // ---------------------------------------------------------------------------
 
 export const microsoftCalendarProvider: CalendarProvider = {
+  async listCalendars(account: AccountWithTokens): Promise<CalendarInfo[]> {
+    const select = "id,name,color,isDefaultCalendar,canEdit";
+    const url =
+      `${GRAPH_BASE}/me/calendars` +
+      `?$select=${encodeURIComponent(select)}`;
+
+    const res = await gfetch(url, account.accessToken);
+    const data = (await res.json()) as GraphList<GraphCalendar>;
+
+    const calendars: CalendarInfo[] = [];
+    for (const c of data.value ?? []) {
+      if (!c.id) continue;
+      calendars.push({
+        id: c.id,
+        accountId: account.id,
+        provider: "microsoft",
+        name: c.name ?? "",
+        // Graph returns a named colour enum, not a hex value; the UI assigns
+        // colours, so we surface null here.
+        color: null,
+        primary: Boolean(c.isDefaultCalendar),
+        canEdit: c.canEdit !== false,
+      });
+    }
+    return calendars;
+  },
+
   async listEvents(
     account: AccountWithTokens,
     range: DateRange,
+    calendarId?: string,
   ): Promise<UnifiedEvent[]> {
     const select =
       "id,subject,bodyPreview,start,end,isAllDay,location,attendees,organizer,onlineMeeting,isOnlineMeeting,webLink";
+    // Scope to a specific calendar when given; otherwise the default view.
+    const path = calendarId
+      ? `/me/calendars/${encodeURIComponent(calendarId)}/calendarView`
+      : `/me/calendarView`;
     const url =
-      `${GRAPH_BASE}/me/calendarView` +
+      `${GRAPH_BASE}${path}` +
       `?startDateTime=${encodeURIComponent(range.start)}` +
       `&endDateTime=${encodeURIComponent(range.end)}` +
       `&$top=250` +
@@ -849,51 +944,89 @@ export const microsoftCalendarProvider: CalendarProvider = {
       headers: { Prefer: 'outlook.timezone="UTC"' },
     });
     const data = (await res.json()) as GraphList<GraphEvent>;
-    return (data.value ?? []).map((e) => mapEvent(account, e));
+    return (data.value ?? []).map((e) =>
+      mapEvent(account, e, calendarId ?? ""),
+    );
   },
 
   async createEvent(
     account: AccountWithTokens,
     draft: EventDraft,
   ): Promise<UnifiedEvent> {
-    const payload: Record<string, unknown> = {
-      subject: draft.title,
-      body: {
-        contentType: "HTML",
-        content: draft.description ?? "",
-      },
-      start: {
-        dateTime: toGraphLocalUtc(draft.start),
-        timeZone: "UTC",
-      },
-      end: {
-        dateTime: toGraphLocalUtc(draft.end),
-        timeZone: "UTC",
-      },
-      isAllDay: Boolean(draft.allDay),
-      attendees: draft.attendees.map((a) => ({
-        emailAddress: a.name
-          ? { address: a.email, name: a.name }
-          : { address: a.email },
-        type: "required",
-      })),
-    };
+    // Graph event ids are global, but creation must target a calendar: post to
+    // the requested calendar's events collection, else the default one.
+    const path = draft.calendarId
+      ? `/me/calendars/${encodeURIComponent(draft.calendarId)}/events`
+      : `/me/events`;
 
-    if (draft.locationType === "physical" && draft.physicalLocation) {
-      payload.location = { displayName: draft.physicalLocation };
-    } else if (
-      draft.locationType === "conference" &&
-      draft.conferenceType === "ms_teams"
-    ) {
-      payload.isOnlineMeeting = true;
-      payload.onlineMeetingProvider = "teamsForBusiness";
-    }
-
-    const res = await gfetch(`${GRAPH_BASE}/me/events`, account.accessToken, {
+    const res = await gfetch(`${GRAPH_BASE}${path}`, account.accessToken, {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify(toGraphEventBody(draft)),
     });
     const created = (await res.json()) as GraphEvent;
-    return mapEvent(account, created);
+    return mapEvent(account, created, draft.calendarId ?? "");
+  },
+
+  async updateEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    draft: EventDraft,
+    calendarId?: string,
+  ): Promise<UnifiedEvent> {
+    // Graph event ids are global, so we patch /me/events/{id} directly and
+    // ignore calendarId for routing (we still record it on the result).
+    const res = await gfetch(
+      `${GRAPH_BASE}/me/events/${encodeURIComponent(eventId)}`,
+      account.accessToken,
+      { method: "PATCH", body: JSON.stringify(toGraphEventBody(draft)) },
+    );
+    const updated = (await res.json()) as GraphEvent;
+    return mapEvent(account, updated, calendarId ?? draft.calendarId ?? "");
+  },
+
+  async deleteEvent(
+    account: AccountWithTokens,
+    eventId: string,
+  ): Promise<void> {
+    // Graph event ids are global; calendarId is intentionally ignored.
+    await gfetch(
+      `${GRAPH_BASE}/me/events/${encodeURIComponent(eventId)}`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
+  },
+
+  async respondToEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    response: AttendeeResponse,
+  ): Promise<void> {
+    // Map our RSVP enum to the Graph response action. "needsAction" is a no-op
+    // (nothing to send). Graph event ids are global; calendarId is ignored.
+    let endpoint: string;
+    switch (response) {
+      case "accepted":
+        endpoint = "accept";
+        break;
+      case "declined":
+        endpoint = "decline";
+        break;
+      case "tentative":
+        endpoint = "tentativelyAccept";
+        break;
+      case "needsAction":
+        return;
+      default: {
+        // Exhaustiveness: a new AttendeeResponse will error at compile time.
+        const exhaustive: never = response;
+        throw new Error(`Unsupported RSVP response: ${String(exhaustive)}`);
+      }
+    }
+
+    await gfetch(
+      `${GRAPH_BASE}/me/events/${encodeURIComponent(eventId)}/${endpoint}`,
+      account.accessToken,
+      { method: "POST", body: JSON.stringify({ sendResponse: true }) },
+    );
   },
 };

@@ -1,7 +1,13 @@
-// GET /api/calendar?start=ISO&end=ISO&accountId=all|ID
+// GET /api/calendar?start=ISO&end=ISO&accountId=all|ID&calendars=...
 // Aggregated unified calendar over a date range. Queries one account or all
 // connected accounts in parallel; a per-account failure is collected into
 // `errors` rather than failing the whole request.
+//
+// When the optional `calendars` param is present it is a comma-separated list
+// of `accountId:encodeURIComponent(calendarId)` pairs. We then fetch events for
+// exactly those (account, calendarId) pairs (grouped by account, one
+// listEvents call per pair) instead of each account's primary calendar.
+// `accountId` still scopes which accounts are eligible.
 
 import {
   getAccountWithTokens,
@@ -27,6 +33,7 @@ export async function GET(req: Request): Promise<Response> {
   const start = searchParams.get("start");
   const end = searchParams.get("end");
   const accountId = searchParams.get("accountId") ?? "all";
+  const calendarsParam = searchParams.get("calendars");
 
   if (!start || !end) {
     return Response.json(
@@ -57,15 +64,33 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const errors: AccountError[] = [];
+  const range = { start, end };
+
+  // Map calendarId lists to the eligible accounts when an explicit selection
+  // was provided. Each entry is one (account, calendarId) pair to fetch.
+  const calendarIdsByAccount = calendarsParam
+    ? parseCalendarPairs(calendarsParam)
+    : null;
 
   const results = await Promise.all(
     accounts.map(async (account): Promise<UnifiedEvent[]> => {
       try {
         await getValidAccessToken(account);
-        return await getCalendarProvider(account.provider).listEvents(account, {
-          start,
-          end,
-        });
+        const provider = getCalendarProvider(account.provider);
+
+        if (calendarIdsByAccount) {
+          const calendarIds = calendarIdsByAccount.get(account.id);
+          // Account is eligible but not selected → contributes no events.
+          if (!calendarIds || calendarIds.length === 0) return [];
+          const perCalendar = await Promise.all(
+            calendarIds.map((calendarId) =>
+              provider.listEvents(account, range, calendarId),
+            ),
+          );
+          return perCalendar.flat();
+        }
+
+        return await provider.listEvents(account, range);
       } catch (err) {
         errors.push({
           accountId: account.id,
@@ -82,6 +107,28 @@ export async function GET(req: Request): Promise<Response> {
     .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
 
   return Response.json({ events, errors });
+}
+
+/** Parses `accountId:encodeURIComponent(calendarId)` pairs into a map of
+ *  accountId → decoded calendarIds. Malformed pairs are skipped. */
+function parseCalendarPairs(raw: string): Map<string, string[]> {
+  const byAccount = new Map<string, string[]>();
+  for (const pair of raw.split(",")) {
+    const sep = pair.indexOf(":");
+    if (sep <= 0 || sep === pair.length - 1) continue;
+    const acctId = pair.slice(0, sep);
+    let calendarId: string;
+    try {
+      calendarId = decodeURIComponent(pair.slice(sep + 1));
+    } catch {
+      continue;
+    }
+    if (calendarId.length === 0) continue;
+    const existing = byAccount.get(acctId);
+    if (existing) existing.push(calendarId);
+    else byAccount.set(acctId, [calendarId]);
+  }
+  return byAccount;
 }
 
 function messageOf(err: unknown): string {
