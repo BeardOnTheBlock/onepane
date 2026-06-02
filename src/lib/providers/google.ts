@@ -37,6 +37,31 @@ import type {
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE = "https://www.googleapis.com/calendar/v3";
 
+// Gmail rejects too many simultaneous per-user requests with HTTP 429
+// ("Too many concurrent requests for user"), so fan-out fetches are pooled.
+const GMAIL_FETCH_CONCURRENCY = 4;
+
+/**
+ * Maps items through `fn` with a bounded number of in-flight calls, preserving
+ * input order. Keeps Gmail's per-user concurrency limit happy on list fan-outs.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    for (let i = cursor++; i < items.length; i = cursor++) {
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // Low-level fetch helper
 // ---------------------------------------------------------------------------
@@ -406,8 +431,10 @@ export const googleMailProvider: MailProvider = {
     const refs = list.messages ?? [];
     if (refs.length === 0) return [];
 
-    const messages = await Promise.all(
-      refs.map(async (ref) => {
+    const messages = await mapWithConcurrency(
+      refs,
+      GMAIL_FETCH_CONCURRENCY,
+      async (ref) => {
         const detailUrl =
           `${GMAIL_BASE}/messages/${encodeURIComponent(ref.id)}` +
           `?format=metadata&${METADATA_HEADERS}`;
@@ -416,7 +443,7 @@ export const googleMailProvider: MailProvider = {
           account.accessToken,
         );
         return toUnifiedMessage(account, msg);
-      }),
+      },
     );
 
     return messages;
@@ -611,8 +638,10 @@ export const googleMailProvider: MailProvider = {
     const refs = list.drafts ?? [];
     if (refs.length === 0) return [];
 
-    const drafts = await Promise.all(
-      refs.map(async (ref) => {
+    const drafts = await mapWithConcurrency(
+      refs,
+      GMAIL_FETCH_CONCURRENCY,
+      async (ref) => {
         const detailUrl =
           `${GMAIL_BASE}/drafts/${encodeURIComponent(ref.id)}` +
           `?format=metadata&metadataHeaders=To&metadataHeaders=Subject`;
@@ -631,7 +660,7 @@ export const googleMailProvider: MailProvider = {
           updatedAt: internalDateToIso(draft.message.internalDate),
         };
         return summary;
-      }),
+      },
     );
 
     return drafts;
