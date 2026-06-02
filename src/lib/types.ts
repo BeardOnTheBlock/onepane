@@ -144,6 +144,28 @@ export interface MailDraft {
   attachments?: OutgoingAttachment[];
 }
 
+/** A saved (unsent) draft as shown in the drafts list. */
+export interface DraftSummary {
+  /** Provider draft id (used to edit/send/delete — distinct from a message id). */
+  id: string;
+  accountId: string;
+  provider: ProviderId;
+  to: MailAddress[];
+  subject: string;
+  snippet: string;
+  updatedAt: string; // ISO
+}
+
+/** The editable content of a saved draft. */
+export interface DraftContent {
+  id: string;
+  to: MailAddress[];
+  cc: MailAddress[];
+  subject: string;
+  bodyText: string;
+  bodyHtml: string | null;
+}
+
 /** Threading context supplied when a draft is a reply to an existing message. */
 export interface ReplyContext {
   inReplyToMessageId: string; // provider message id being replied to
@@ -261,6 +283,26 @@ export interface MailProvider {
     messageIds: string[],
     action: MailActionType,
   ): Promise<void>;
+  /** Lists saved (unsent) drafts. */
+  listDrafts(account: AccountWithTokens, limit: number): Promise<DraftSummary[]>;
+  /** Loads a draft's editable content. */
+  getDraft(account: AccountWithTokens, draftId: string): Promise<DraftContent>;
+  /** Creates a draft from a MailDraft; returns the new draft id. */
+  createDraft(
+    account: AccountWithTokens,
+    draft: MailDraft,
+    reply?: ReplyContext,
+  ): Promise<string>;
+  /** Replaces a draft's content. */
+  updateDraft(
+    account: AccountWithTokens,
+    draftId: string,
+    draft: MailDraft,
+  ): Promise<void>;
+  /** Sends a saved draft. */
+  sendDraft(account: AccountWithTokens, draftId: string): Promise<void>;
+  /** Deletes a saved draft. */
+  deleteDraft(account: AccountWithTokens, draftId: string): Promise<void>;
   sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
@@ -311,6 +353,18 @@ export interface MailThreadResponse {
 
 export interface MailLabelsResponse {
   labels: MailLabel[];
+}
+
+export interface DraftsListResponse {
+  drafts: DraftSummary[];
+}
+
+export interface DraftResponse {
+  draft: DraftContent;
+}
+
+export interface CreateDraftResponse {
+  draftId: string;
 }
 
 export interface CalendarListResponse {
