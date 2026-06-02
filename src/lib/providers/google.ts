@@ -17,6 +17,8 @@ import type {
   ConferenceType,
   DateRange,
   DownloadedAttachment,
+  DraftContent,
+  DraftSummary,
   EventAttendee,
   EventDraft,
   MailActionType,
@@ -595,86 +597,135 @@ export const googleMailProvider: MailProvider = {
     }
   },
 
+  async listDrafts(
+    account: AccountWithTokens,
+    limit: number,
+  ): Promise<DraftSummary[]> {
+    const listUrl = `${GMAIL_BASE}/drafts?maxResults=${encodeURIComponent(String(limit))}`;
+    const list = await gfetchJson<{
+      drafts?: Array<{ id: string; message?: { id: string } }>;
+    }>(listUrl, account.accessToken);
+
+    const refs = list.drafts ?? [];
+    if (refs.length === 0) return [];
+
+    const drafts = await Promise.all(
+      refs.map(async (ref) => {
+        const detailUrl =
+          `${GMAIL_BASE}/drafts/${encodeURIComponent(ref.id)}` +
+          `?format=metadata&metadataHeaders=To&metadataHeaders=Subject`;
+        const draft = await gfetchJson<{ id: string; message: GmailMessage }>(
+          detailUrl,
+          account.accessToken,
+        );
+        const headers = draft.message.payload?.headers;
+        const summary: DraftSummary = {
+          id: draft.id,
+          accountId: account.id,
+          provider: "google",
+          to: parseAddressList(header(headers, "To")),
+          subject: header(headers, "Subject"),
+          snippet: draft.message.snippet ?? "",
+          updatedAt: internalDateToIso(draft.message.internalDate),
+        };
+        return summary;
+      }),
+    );
+
+    return drafts;
+  },
+
+  async getDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<DraftContent> {
+    const url = `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}?format=full`;
+    const draft = await gfetchJson<{ id: string; message: GmailMessage }>(
+      url,
+      account.accessToken,
+    );
+
+    const full = toFullMessage(account, draft.message);
+    return {
+      id: draftId,
+      to: full.to,
+      cc: full.cc,
+      subject: full.subject,
+      bodyText: full.bodyText ?? "",
+      bodyHtml: full.bodyHtml,
+    };
+  },
+
+  async createDraft(
+    account: AccountWithTokens,
+    draft: MailDraft,
+    reply?: ReplyContext,
+  ): Promise<string> {
+    const message: { raw: string; threadId?: string } = {
+      raw: buildRawMessage(account, draft, reply),
+    };
+    if (reply?.threadId) {
+      message.threadId = reply.threadId;
+    }
+
+    const created = await gfetchJson<{ id: string }>(
+      `${GMAIL_BASE}/drafts`,
+      account.accessToken,
+      {
+        method: "POST",
+        body: JSON.stringify({ message }),
+      },
+    );
+
+    return created.id;
+  },
+
+  async updateDraft(
+    account: AccountWithTokens,
+    draftId: string,
+    draft: MailDraft,
+  ): Promise<void> {
+    await gfetch(
+      `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          message: { raw: buildRawMessage(account, draft) },
+        }),
+      },
+    );
+  },
+
+  async sendDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    await gfetch(`${GMAIL_BASE}/drafts/send`, account.accessToken, {
+      method: "POST",
+      body: JSON.stringify({ id: draftId }),
+    });
+  },
+
+  async deleteDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    // The drafts.delete endpoint returns 204 with no body, so use gfetch
+    // rather than gfetchJson and discard the response.
+    await gfetch(
+      `${GMAIL_BASE}/drafts/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
+  },
+
   async sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
     reply?: ReplyContext,
   ): Promise<void> {
-    const useHtml = typeof draft.bodyHtml === "string" && draft.bodyHtml.length > 0;
-    const bodyContentType = useHtml
-      ? 'text/html; charset="utf-8"'
-      : 'text/plain; charset="utf-8"';
-    const body = useHtml ? (draft.bodyHtml as string) : draft.bodyText;
-
-    const attachments = draft.attachments ?? [];
-    const hasAttachments = attachments.length > 0;
-
-    // Top-level headers, shared by both the single-part and multipart paths.
-    const topHeaders: string[] = [];
-    topHeaders.push(`From: ${account.email}`);
-    topHeaders.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
-    if (draft.cc && draft.cc.length > 0) {
-      topHeaders.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
-    }
-    topHeaders.push(`Subject: ${draft.subject}`);
-    topHeaders.push("MIME-Version: 1.0");
-
-    if (reply?.messageIdHeader) {
-      topHeaders.push(`In-Reply-To: ${reply.messageIdHeader}`);
-      const references = reply.references
-        ? `${reply.references} ${reply.messageIdHeader}`
-        : reply.messageIdHeader;
-      topHeaders.push(`References: ${references}`);
-    }
-
-    let rawMessage: string;
-
-    if (hasAttachments) {
-      // multipart/mixed: a single body part followed by one part per file.
-      const boundary = `==onepane_${randomBytes(16).toString("hex")}==`;
-      topHeaders.push(
-        `Content-Type: multipart/mixed; boundary="${boundary}"`,
-      );
-
-      const segments: string[] = [];
-
-      // Body part.
-      segments.push(
-        [
-          `--${boundary}`,
-          `Content-Type: ${bodyContentType}`,
-          "Content-Transfer-Encoding: 7bit",
-          "",
-          body,
-        ].join("\r\n"),
-      );
-
-      // Attachment parts.
-      for (const att of attachments) {
-        const filename = att.filename || "attachment";
-        const mimeType = att.mimeType || "application/octet-stream";
-        segments.push(
-          [
-            `--${boundary}`,
-            `Content-Type: ${mimeType}; name="${filename}"`,
-            "Content-Transfer-Encoding: base64",
-            `Content-Disposition: attachment; filename="${filename}"`,
-            "",
-            wrapBase64(att.contentBase64),
-          ].join("\r\n"),
-        );
-      }
-
-      // Closing boundary.
-      const bodyBlock = `${segments.join("\r\n")}\r\n--${boundary}--`;
-      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${bodyBlock}`;
-    } else {
-      // Single-part path — unchanged from the original implementation.
-      topHeaders.push(`Content-Type: ${bodyContentType}`);
-      rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${body}`;
-    }
-
-    const raw = encodeBase64Url(rawMessage);
+    const raw = buildRawMessage(account, draft, reply);
 
     const payload: { raw: string; threadId?: string } = { raw };
     if (reply?.threadId) {
@@ -687,6 +738,94 @@ export const googleMailProvider: MailProvider = {
     });
   },
 };
+
+/**
+ * Builds an RFC 2822 message from a MailDraft and returns it as URL-safe
+ * base64 (the `raw` field accepted by Gmail's messages.send and drafts
+ * create/update endpoints). Handles both single-part bodies and multipart/
+ * mixed messages carrying attachments, and threads replies via In-Reply-To/
+ * References headers. Shared by sendMessage, createDraft and updateDraft.
+ */
+function buildRawMessage(
+  account: AccountWithTokens,
+  draft: MailDraft,
+  reply?: ReplyContext,
+): string {
+  const useHtml =
+    typeof draft.bodyHtml === "string" && draft.bodyHtml.length > 0;
+  const bodyContentType = useHtml
+    ? 'text/html; charset="utf-8"'
+    : 'text/plain; charset="utf-8"';
+  const body = useHtml ? (draft.bodyHtml as string) : draft.bodyText;
+
+  const attachments = draft.attachments ?? [];
+  const hasAttachments = attachments.length > 0;
+
+  // Top-level headers, shared by both the single-part and multipart paths.
+  const topHeaders: string[] = [];
+  topHeaders.push(`From: ${account.email}`);
+  topHeaders.push(`To: ${draft.to.map(formatHeaderAddress).join(", ")}`);
+  if (draft.cc && draft.cc.length > 0) {
+    topHeaders.push(`Cc: ${draft.cc.map(formatHeaderAddress).join(", ")}`);
+  }
+  topHeaders.push(`Subject: ${draft.subject}`);
+  topHeaders.push("MIME-Version: 1.0");
+
+  if (reply?.messageIdHeader) {
+    topHeaders.push(`In-Reply-To: ${reply.messageIdHeader}`);
+    const references = reply.references
+      ? `${reply.references} ${reply.messageIdHeader}`
+      : reply.messageIdHeader;
+    topHeaders.push(`References: ${references}`);
+  }
+
+  let rawMessage: string;
+
+  if (hasAttachments) {
+    // multipart/mixed: a single body part followed by one part per file.
+    const boundary = `==onepane_${randomBytes(16).toString("hex")}==`;
+    topHeaders.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+
+    const segments: string[] = [];
+
+    // Body part.
+    segments.push(
+      [
+        `--${boundary}`,
+        `Content-Type: ${bodyContentType}`,
+        "Content-Transfer-Encoding: 7bit",
+        "",
+        body,
+      ].join("\r\n"),
+    );
+
+    // Attachment parts.
+    for (const att of attachments) {
+      const filename = att.filename || "attachment";
+      const mimeType = att.mimeType || "application/octet-stream";
+      segments.push(
+        [
+          `--${boundary}`,
+          `Content-Type: ${mimeType}; name="${filename}"`,
+          "Content-Transfer-Encoding: base64",
+          `Content-Disposition: attachment; filename="${filename}"`,
+          "",
+          wrapBase64(att.contentBase64),
+        ].join("\r\n"),
+      );
+    }
+
+    // Closing boundary.
+    const bodyBlock = `${segments.join("\r\n")}\r\n--${boundary}--`;
+    rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${bodyBlock}`;
+  } else {
+    // Single-part path — unchanged from the original implementation.
+    topHeaders.push(`Content-Type: ${bodyContentType}`);
+    rawMessage = `${topHeaders.join("\r\n")}\r\n\r\n${body}`;
+  }
+
+  return encodeBase64Url(rawMessage);
+}
 
 /**
  * Recursively searches a Gmail payload for the part whose body.attachmentId

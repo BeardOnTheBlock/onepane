@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Paperclip, Send, X } from "lucide-react";
+import { FileText, Loader2, Paperclip, Save, Send, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { AccountDot } from "@/components/account-dot";
@@ -24,12 +24,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { accountById } from "@/hooks/use-accounts";
-import { FetchError, postJson } from "@/lib/fetcher";
+import { del, FetchError, fetcher, patchJson, postJson } from "@/lib/fetcher";
 import { cn } from "@/lib/utils";
 import type {
   AccountPublic,
+  CreateDraftResponse,
+  DraftResponse,
   MailAddress,
   MailDraft,
   OkResponse,
@@ -77,8 +80,19 @@ export interface ComposeDialogProps {
   defaultAccountId?: string;
   /** When present, the dialog is a reply: recipients/subject filled, From locked. */
   prefill?: ComposePrefill;
+  /**
+   * When present, the dialog edits an existing saved draft: its content is
+   * loaded from the provider on open and the From account is locked to the
+   * draft's account. Takes precedence over `prefill`.
+   */
+  editDraftId?: string;
+  /** The account the edited draft belongs to (required with `editDraftId`). */
+  editDraftAccountId?: string;
   /** Called after a successful send (e.g. to revalidate the list). */
   onSent?: () => void;
+  /** Called after a draft is created, updated, sent, or deleted, so the drafts
+   *  list can revalidate. */
+  onDraftsChanged?: () => void;
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -102,9 +116,15 @@ export function ComposeDialog({
   accounts,
   defaultAccountId,
   prefill,
+  editDraftId,
+  editDraftAccountId,
   onSent,
+  onDraftsChanged,
 }: ComposeDialogProps) {
-  const isReply = Boolean(prefill);
+  const isDraftEdit = Boolean(editDraftId);
+  const isReply = !isDraftEdit && Boolean(prefill);
+  // From is locked for replies and for draft edits (the draft owns its account).
+  const accountLocked = isReply || isDraftEdit;
 
   const [accountId, setAccountId] = React.useState("");
   const [to, setTo] = React.useState("");
@@ -114,12 +134,77 @@ export function ComposeDialog({
   const [body, setBody] = React.useState("");
   const [attachments, setAttachments] = React.useState<PendingAttachment[]>([]);
   const [sending, setSending] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  // The provider draft id once the message has been saved at least once. Seeded
+  // from `editDraftId` in draft-edit mode; set after the first "Save as draft".
+  const [draftId, setDraftId] = React.useState<string | null>(null);
+  // True while loading an existing draft's content for draft-edit mode.
+  const [loadingDraft, setLoadingDraft] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
 
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  // Initialise (or reset) the form whenever the dialog opens.
+  // Initialise (or reset) the form whenever the dialog opens. In draft-edit mode
+  // we fetch the saved content and prefill it; an aborted/closed dialog discards
+  // a late response.
   React.useEffect(() => {
     if (!open) return;
+
+    setCc("");
+    setShowCc(false);
+    setAttachments([]);
+    setSending(false);
+    setSaving(false);
+    setDeleting(false);
+    setLoadError(null);
+
+    if (editDraftId) {
+      // Draft-edit mode: lock From to the draft's account, then load content.
+      setDraftId(editDraftId);
+      setAccountId(editDraftAccountId ?? "");
+      setTo("");
+      setSubject("");
+      setBody("");
+      setLoadingDraft(true);
+
+      let cancelled = false;
+      const url = `/api/mail/drafts/content?accountId=${encodeURIComponent(
+        editDraftAccountId ?? "",
+      )}&id=${encodeURIComponent(editDraftId)}`;
+
+      fetcher<DraftResponse>(url)
+        .then(({ draft }) => {
+          if (cancelled) return;
+          setTo(formatRecipients(draft.to));
+          if (draft.cc.length > 0) {
+            setCc(formatRecipients(draft.cc));
+            setShowCc(true);
+          }
+          setSubject(draft.subject);
+          setBody(draft.bodyText);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setLoadError(
+            err instanceof FetchError
+              ? err.message
+              : "Couldn't load this draft.",
+          );
+        })
+        .finally(() => {
+          if (!cancelled) setLoadingDraft(false);
+        });
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Fresh compose / reply: no existing draft yet.
+    setDraftId(null);
+    setLoadingDraft(false);
+    setBody("");
     if (prefill) {
       setAccountId(prefill.accountId);
       setTo(formatRecipients(prefill.to));
@@ -129,14 +214,9 @@ export function ComposeDialog({
       setTo("");
       setSubject("");
     }
-    setCc("");
-    setShowCc(false);
-    setBody("");
-    setAttachments([]);
-    setSending(false);
     // We intentionally only re-run when the dialog transitions open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, editDraftId]);
 
   const totalAttachmentBytes = React.useMemo(
     () => attachments.reduce((sum, a) => sum + a.size, 0),
@@ -194,15 +274,25 @@ export function ComposeDialog({
   const hasSubject = subject.trim().length > 0;
   const ccValid = invalidCc.length === 0;
 
+  // Any in-flight network call locks the form (and the close handler).
+  const busy = sending || saving || deleting || loadingDraft;
+
   const canSend =
-    !sending && Boolean(accountId) && hasValidRecipient && hasSubject && ccValid;
+    !busy &&
+    Boolean(accountId) &&
+    hasValidRecipient &&
+    hasSubject &&
+    ccValid;
+
+  // A draft can be saved with looser requirements than a send: as long as the
+  // addresses that *are* present are well-formed and we have an account.
+  const canSave =
+    !busy && Boolean(accountId) && invalidRecipients.length === 0 && ccValid;
 
   const selectedAccount = accountById(accounts, accountId);
 
-  async function handleSend() {
-    if (!canSend) return;
-    setSending(true);
-
+  /** Build the MailDraft payload from the current form state. */
+  function buildDraft(): MailDraft {
     const outgoing: OutgoingAttachment[] = attachments.map(
       ({ filename, mimeType, contentBase64 }) => ({
         filename,
@@ -210,16 +300,42 @@ export function ComposeDialog({
         contentBase64,
       }),
     );
-
-    const draft: MailDraft = {
+    return {
       to: recipients,
       subject: subject.trim(),
       bodyText: body,
       ...(showCc && ccRecipients.length > 0 ? { cc: ccRecipients } : {}),
       ...(outgoing.length > 0 ? { attachments: outgoing } : {}),
     };
+  }
+
+  async function handleSend() {
+    if (!canSend) return;
+    setSending(true);
+
+    const draft = buildDraft();
 
     try {
+      // A loaded draft is sent through the provider's draft-send so the saved
+      // copy is consumed rather than left behind as a duplicate. Save any local
+      // edits first so what's sent matches what's on screen.
+      if (isDraftEdit && draftId) {
+        await patchJson<OkResponse>("/api/mail/drafts", {
+          accountId,
+          draftId,
+          draft,
+        });
+        await postJson<OkResponse>("/api/mail/drafts/send", {
+          accountId,
+          draftId,
+        });
+        toast.success("Message sent");
+        onDraftsChanged?.();
+        onSent?.();
+        onOpenChange(false);
+        return;
+      }
+
       await postJson<OkResponse>("/api/mail/send", {
         accountId,
         draft,
@@ -238,23 +354,108 @@ export function ComposeDialog({
     }
   }
 
+  async function handleSaveDraft() {
+    if (!canSave) return;
+    setSaving(true);
+
+    const draft = buildDraft();
+
+    try {
+      if (draftId) {
+        await patchJson<OkResponse>("/api/mail/drafts", {
+          accountId,
+          draftId,
+          draft,
+        });
+      } else {
+        const { draftId: newId } = await postJson<CreateDraftResponse>(
+          "/api/mail/drafts",
+          {
+            accountId,
+            draft,
+            ...(prefill ? { reply: prefill.reply } : {}),
+          },
+        );
+        setDraftId(newId);
+      }
+      toast.success("Draft saved");
+      onDraftsChanged?.();
+    } catch (err) {
+      const message =
+        err instanceof FetchError
+          ? err.message
+          : "Couldn't save the draft. Please try again.";
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDeleteDraft() {
+    if (!draftId || busy) return;
+    setDeleting(true);
+
+    try {
+      await del<OkResponse>("/api/mail/drafts", { accountId, draftId });
+      toast.success("Draft deleted");
+      onDraftsChanged?.();
+      onOpenChange(false);
+    } catch (err) {
+      const message =
+        err instanceof FetchError
+          ? err.message
+          : "Couldn't delete the draft. Please try again.";
+      toast.error(message);
+      setDeleting(false);
+    }
+  }
+
+  const title = isDraftEdit ? "Edit draft" : isReply ? "Reply" : "New message";
+  const description = isDraftEdit
+    ? "Update this saved draft, then send it or save your changes."
+    : isReply
+      ? "Your reply will be sent from the account this message was received on."
+      : "Compose a message from any of your connected accounts.";
+
   return (
-    <Dialog open={open} onOpenChange={(next) => !sending && onOpenChange(next)}>
+    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{isReply ? "Reply" : "New message"}</DialogTitle>
-          <DialogDescription>
-            {isReply
-              ? "Your reply will be sent from the account this message was received on."
-              : "Compose a message from any of your connected accounts."}
-          </DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
 
+        {loadError ? (
+          <div className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {loadError}
+          </div>
+        ) : null}
+
+        {loadingDraft ? (
+          <div className="grid gap-4" aria-busy="true">
+            <div className="grid gap-2">
+              <Skeleton className="h-4 w-12" />
+              <Skeleton className="h-9 w-full" />
+            </div>
+            <div className="grid gap-2">
+              <Skeleton className="h-4 w-10" />
+              <Skeleton className="h-9 w-full" />
+            </div>
+            <div className="grid gap-2">
+              <Skeleton className="h-4 w-16" />
+              <Skeleton className="h-9 w-full" />
+            </div>
+            <div className="grid gap-2">
+              <Skeleton className="h-4 w-16" />
+              <Skeleton className="h-[180px] w-full" />
+            </div>
+          </div>
+        ) : (
         <div className="grid gap-4">
           {/* From */}
           <div className="grid gap-2">
             <Label htmlFor="compose-from">From</Label>
-            {isReply ? (
+            {accountLocked ? (
               <div className="flex h-9 items-center gap-2 rounded-md border border-input bg-muted/40 px-3 text-sm">
                 {selectedAccount ? (
                   <>
@@ -371,7 +572,7 @@ export function ComposeDialog({
                 variant="outline"
                 size="sm"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={sending}
+                disabled={busy}
               >
                 <Paperclip aria-hidden="true" />
                 Attach files
@@ -425,7 +626,7 @@ export function ComposeDialog({
                       <button
                         type="button"
                         onClick={() => removeAttachment(index)}
-                        disabled={sending}
+                        disabled={busy}
                         aria-label={`Remove ${att.filename}`}
                         title={`Remove ${att.filename}`}
                         className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
@@ -439,29 +640,75 @@ export function ComposeDialog({
             ) : null}
           </div>
         </div>
+        )}
 
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={sending}
-          >
-            Cancel
-          </Button>
-          <Button type="button" onClick={handleSend} disabled={!canSend}>
-            {sending ? (
-              <>
-                <Loader2 className="animate-spin" aria-hidden="true" />
-                Sending…
-              </>
-            ) : (
-              <>
-                <Send aria-hidden="true" />
-                Send
-              </>
-            )}
-          </Button>
+        <DialogFooter className="gap-2 sm:justify-between">
+          {/* Left cluster: destructive delete (draft-edit only). */}
+          <div className="flex items-center gap-2">
+            {isDraftEdit ? (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={handleDeleteDraft}
+                disabled={busy || !draftId}
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              >
+                {deleting ? (
+                  <Loader2 className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <Trash2 aria-hidden="true" />
+                )}
+                Delete draft
+              </Button>
+            ) : null}
+          </div>
+
+          {/* Right cluster: cancel / save / send. */}
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleSaveDraft}
+              disabled={!canSave}
+            >
+              {saving ? (
+                <>
+                  <Loader2 className="animate-spin" aria-hidden="true" />
+                  Saving…
+                </>
+              ) : (
+                <>
+                  {isDraftEdit ? (
+                    <Save aria-hidden="true" />
+                  ) : (
+                    <FileText aria-hidden="true" />
+                  )}
+                  {isDraftEdit ? "Save changes" : "Save as draft"}
+                </>
+              )}
+            </Button>
+            <Button type="button" onClick={handleSend} disabled={!canSend}>
+              {sending ? (
+                <>
+                  <Loader2 className="animate-spin" aria-hidden="true" />
+                  Sending…
+                </>
+              ) : (
+                <>
+                  <Send aria-hidden="true" />
+                  Send
+                </>
+              )}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

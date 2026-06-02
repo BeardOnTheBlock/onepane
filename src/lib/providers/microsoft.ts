@@ -18,6 +18,8 @@ import type {
   ConferenceType,
   DateRange,
   DownloadedAttachment,
+  DraftContent,
+  DraftSummary,
   EventAttendee,
   EventDraft,
   MailActionType,
@@ -107,6 +109,7 @@ interface GraphMessage {
   toRecipients?: GraphRecipient[] | null;
   ccRecipients?: GraphRecipient[] | null;
   receivedDateTime?: string | null;
+  lastModifiedDateTime?: string | null;
   isRead?: boolean | null;
   hasAttachments?: boolean | null;
   bodyPreview?: string | null;
@@ -190,6 +193,24 @@ function toMailAddresses(
     if (a) out.push(a);
   }
   return out;
+}
+
+/**
+ * Build the Graph message body used to create or replace a draft. Prefers HTML
+ * when the draft carries it, falling back to plain text. Shared by createDraft
+ * (POST) and updateDraft (PATCH) so both send identical fields.
+ */
+function toGraphDraftBody(draft: MailDraft): Record<string, unknown> {
+  const useHtml = Boolean(draft.bodyHtml);
+  return {
+    subject: draft.subject,
+    body: {
+      contentType: useHtml ? "HTML" : "Text",
+      content: draft.bodyHtml ?? draft.bodyText,
+    },
+    toRecipients: toGraphRecipients(draft.to),
+    ccRecipients: toGraphRecipients(draft.cc ?? []),
+  };
 }
 
 /** Build the JSON recipient objects Graph expects from our MailAddress list. */
@@ -615,6 +636,107 @@ export const microsoftMailProvider: MailProvider = {
         throw new Error(`Unsupported mail action: ${String(exhaustive)}`);
       }
     }
+  },
+
+  async listDrafts(
+    account: AccountWithTokens,
+    limit: number,
+  ): Promise<DraftSummary[]> {
+    const select =
+      "id,subject,toRecipients,bodyPreview,lastModifiedDateTime";
+    const url =
+      `${GRAPH_BASE}/me/mailFolders/drafts/messages` +
+      `?$top=${encodeURIComponent(String(limit))}` +
+      `&$orderby=${encodeURIComponent("lastModifiedDateTime desc")}` +
+      `&$select=${encodeURIComponent(select)}`;
+
+    const res = await gfetch(url, account.accessToken);
+    const data = (await res.json()) as GraphList<GraphMessage>;
+    return (data.value ?? []).map((m) => ({
+      id: m.id,
+      accountId: account.id,
+      provider: "microsoft" as const,
+      to: toMailAddresses(m.toRecipients),
+      subject: m.subject ?? "",
+      snippet: m.bodyPreview ?? "",
+      updatedAt: m.lastModifiedDateTime ?? "",
+    }));
+  },
+
+  async getDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<DraftContent> {
+    const select =
+      "id,subject,from,toRecipients,ccRecipients,body,internetMessageId,receivedDateTime,conversationId,isRead,hasAttachments,bodyPreview";
+    const expand = "attachments($select=id,name,contentType,size,isInline)";
+    const url =
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}` +
+      `?$select=${encodeURIComponent(select)}` +
+      `&$expand=${encodeURIComponent(expand)}`;
+
+    const res = await gfetch(url, account.accessToken);
+    const m = (await res.json()) as GraphMessage;
+    const full = toFullMessage(account, m);
+
+    return {
+      id: draftId,
+      to: full.to,
+      cc: full.cc,
+      subject: full.subject,
+      bodyText: full.bodyText ?? "",
+      bodyHtml: full.bodyHtml,
+    };
+  },
+
+  async createDraft(
+    account: AccountWithTokens,
+    draft: MailDraft,
+    _reply?: ReplyContext,
+  ): Promise<string> {
+    // Reply threading is not required for Graph drafts; the reply param is
+    // intentionally ignored. Creating a message (without sending) lands it in
+    // the Drafts folder, and its message id IS the draft id.
+    const res = await gfetch(`${GRAPH_BASE}/me/messages`, account.accessToken, {
+      method: "POST",
+      body: JSON.stringify(toGraphDraftBody(draft)),
+    });
+    const created = (await res.json()) as { id: string };
+    return created.id;
+  },
+
+  async updateDraft(
+    account: AccountWithTokens,
+    draftId: string,
+    draft: MailDraft,
+  ): Promise<void> {
+    await gfetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      { method: "PATCH", body: JSON.stringify(toGraphDraftBody(draft)) },
+    );
+  },
+
+  async sendDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    await gfetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}/send`,
+      account.accessToken,
+      { method: "POST" },
+    );
+  },
+
+  async deleteDraft(
+    account: AccountWithTokens,
+    draftId: string,
+  ): Promise<void> {
+    await gfetch(
+      `${GRAPH_BASE}/me/messages/${encodeURIComponent(draftId)}`,
+      account.accessToken,
+      { method: "DELETE" },
+    );
   },
 
   async sendMessage(
