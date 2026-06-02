@@ -3,7 +3,7 @@
 import useSWR from "swr";
 
 import { fetcher } from "@/lib/fetcher";
-import type { ProviderId } from "@/lib/types";
+import type { OAuthProviderId } from "@/lib/types";
 
 /** Mirror of the server's ProviderCredentialStatus (never includes the secret). */
 export interface ProviderCredentialStatus {
@@ -18,11 +18,11 @@ export interface ProviderCredentialStatus {
 }
 
 interface CredentialsResponse {
-  providers: Record<ProviderId, ProviderCredentialStatus>;
+  providers: Record<OAuthProviderId, ProviderCredentialStatus>;
 }
 
 export interface UseProviderCredentialsResult {
-  statuses: Record<ProviderId, ProviderCredentialStatus> | undefined;
+  statuses: Record<OAuthProviderId, ProviderCredentialStatus> | undefined;
   isLoading: boolean;
   error: Error | undefined;
   mutate: () => void;

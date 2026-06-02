@@ -6,10 +6,12 @@
 // branch on the provider themselves.
 // ============================================================================
 
+import { caldavCalendarProvider } from "@/lib/providers/caldav";
 import {
   googleCalendarProvider,
   googleMailProvider,
 } from "@/lib/providers/google";
+import { imapMailProvider } from "@/lib/providers/imap";
 import {
   microsoftCalendarProvider,
   microsoftMailProvider,
@@ -27,6 +29,8 @@ export function getMailProvider(provider: ProviderId): MailProvider {
       return googleMailProvider;
     case "microsoft":
       return microsoftMailProvider;
+    case "imap":
+      return imapMailProvider;
     default:
       // Exhaustiveness guard — keeps this honest if ProviderId ever grows.
       throw new Error(`Unknown provider: ${provider as string}`);
@@ -40,6 +44,8 @@ export function getCalendarProvider(provider: ProviderId): CalendarProvider {
       return googleCalendarProvider;
     case "microsoft":
       return microsoftCalendarProvider;
+    case "imap":
+      return caldavCalendarProvider;
     default:
       throw new Error(`Unknown provider: ${provider as string}`);
   }

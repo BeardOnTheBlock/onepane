@@ -18,39 +18,116 @@ import {
   groupConversations,
   type Conversation,
 } from "@/components/inbox/conversations";
+import { DraftsList } from "@/components/inbox/drafts-list";
+import { LabelFilter } from "@/components/inbox/label-filter";
 import { MailList } from "@/components/inbox/mail-list";
 import { MailReader, type ReaderSelection } from "@/components/inbox/mail-reader";
 import { SearchInput } from "@/components/inbox/search-input";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useAccounts } from "@/hooks/use-accounts";
+import { accountById, useAccounts } from "@/hooks/use-accounts";
+import { useDrafts } from "@/hooks/use-drafts";
+import { useLabels } from "@/hooks/use-labels";
+import {
+  useMailActions,
+  type ActionTarget,
+} from "@/hooks/use-mail-actions";
+import { del, FetchError } from "@/lib/fetcher";
 import { fetcher } from "@/lib/fetcher";
 import { cn } from "@/lib/utils";
-import type { AccountError, MailListResponse, UnifiedMessage } from "@/lib/types";
+import type {
+  AccountError,
+  DraftSummary,
+  MailLabel,
+  MailListResponse,
+  OkResponse,
+  UnifiedMessage,
+} from "@/lib/types";
 
 const PAGE_SIZE = 25;
 const SEARCH_DEBOUNCE_MS = 350;
 
-/** Stable key for the message list given the account filter and search term. */
-function mailKey(accountId: string, query: string): string {
+/**
+ * Stable key for the message list given the account filter, search term, and
+ * (single-account only) the selected label/folder. `labelId` is ignored for
+ * "all accounts" since labels are inherently per-account.
+ */
+function mailKey(
+  accountId: string,
+  query: string,
+  labelId: string | null,
+): string {
   const base = `/api/mail?accountId=${encodeURIComponent(
     accountId,
   )}&limit=${PAGE_SIZE}`;
   const q = query.trim();
-  return q ? `${base}&q=${encodeURIComponent(q)}` : base;
+  let key = q ? `${base}&q=${encodeURIComponent(q)}` : base;
+  if (accountId !== ALL_ACCOUNTS && labelId) {
+    key += `&labelId=${encodeURIComponent(labelId)}`;
+  }
+  return key;
+}
+
+/**
+ * True when the given selection points at the account's Drafts view: Gmail's
+ * `DRAFT` system label, or any folder/label whose name is "Drafts" (Outlook's
+ * folder id is opaque, so we fall back to a case-insensitive name match).
+ */
+function isDraftsSelection(
+  labelId: string | null,
+  labels: MailLabel[],
+): boolean {
+  if (!labelId) return false;
+  if (labelId === "DRAFT") return true;
+  const label = labels.find((l) => l.id === labelId);
+  return label?.name.trim().toLowerCase() === "drafts";
 }
 
 export default function InboxPage() {
   const { accounts, isLoading: accountsLoading } = useAccounts();
 
   const [filter, setFilter] = React.useState<string>(ALL_ACCOUNTS);
+  const [labelId, setLabelId] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
   const [debouncedQuery, setDebouncedQuery] = React.useState("");
   const [selected, setSelected] = React.useState<ReaderSelection | null>(null);
 
+  // The single account being viewed, if any (labels are per-account).
+  const singleAccount =
+    filter === ALL_ACCOUNTS ? undefined : accountById(accounts, filter);
+
+  // Labels of the single account: used to detect the Drafts view (folder ids
+  // are opaque on Outlook, so we match the selected label by name there).
+  const { labels } = useLabels(singleAccount?.id ?? null);
+  const draftsView = Boolean(
+    singleAccount && isDraftsSelection(labelId, labels),
+  );
+
+  // Changing the account filter clears any label selection: labels belong to a
+  // specific account, and "all accounts" has no label view at all.
+  const handleFilterChange = React.useCallback((next: string) => {
+    setFilter(next);
+    setLabelId(null);
+  }, []);
+
   const [composeOpen, setComposeOpen] = React.useState(false);
   const [prefill, setPrefill] = React.useState<ComposePrefill | undefined>();
+  // When set, the compose dialog opens in draft-edit mode for this draft.
+  const [editDraft, setEditDraft] = React.useState<{
+    id: string;
+    accountId: string;
+  } | null>(null);
+
+  // Drafts for the single account (only when the Drafts view is active).
+  const { drafts, isLoading: draftsLoading, mutate: mutateDrafts } = useDrafts(
+    draftsView && singleAccount ? singleAccount.id : null,
+  );
+
+  // Ids currently being deleted from the drafts list (for per-row spinners).
+  const [deletingDraftIds, setDeletingDraftIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
 
   // Debounce the search term into the SWR key.
   React.useEffect(() => {
@@ -63,7 +140,9 @@ export default function InboxPage() {
 
   const { data, error, isLoading, isValidating, mutate } =
     useSWR<MailListResponse>(
-      accounts.length > 0 ? mailKey(filter, debouncedQuery) : null,
+      accounts.length > 0
+        ? mailKey(filter, debouncedQuery, labelId)
+        : null,
       fetcher,
       { revalidateOnFocus: false },
     );
@@ -123,6 +202,40 @@ export default function InboxPage() {
     ? `${selected.accountId}:${selected.threadId ?? selected.messageId}`
     : null;
 
+  // Clear the reader selection when its conversation gets trashed/archived.
+  const handleRemoved = React.useCallback((target: ActionTarget) => {
+    setSelected((prev) => {
+      if (!prev || prev.accountId !== target.accountId) return prev;
+      const ids = new Set(target.messageIds);
+      return ids.has(prev.messageId) ? null : prev;
+    });
+  }, []);
+
+  const { applyAction } = useMailActions({
+    mutate,
+    onRemoved: handleRemoved,
+  });
+
+  // After a successful "Move to…", optimistically drop the conversation from the
+  // current view (it has left this label/inbox), and clear the reader selection
+  // if it was showing it. The move-to menu owns the network call + toast.
+  const handleMoved = React.useCallback(
+    (target: ActionTarget) => {
+      const ids = new Set(target.messageIds);
+      void mutate(
+        (current) => ({
+          messages: (current?.messages ?? []).filter(
+            (m) => !(m.accountId === target.accountId && ids.has(m.id)),
+          ),
+          errors: current?.errors ?? [],
+        }),
+        { revalidate: false },
+      );
+      handleRemoved(target);
+    },
+    [mutate, handleRemoved],
+  );
+
   const handleSelect = React.useCallback((conversation: Conversation) => {
     setSelected({
       accountId: conversation.accountId,
@@ -133,15 +246,74 @@ export default function InboxPage() {
 
   const handleCompose = React.useCallback(() => {
     setPrefill(undefined);
+    setEditDraft(null);
     setComposeOpen(true);
   }, []);
 
   const handleReply = React.useCallback((next: ComposePrefill) => {
     setPrefill(next);
+    setEditDraft(null);
     setComposeOpen(true);
   }, []);
 
+  // Open a saved draft in the compose dialog's draft-edit mode.
+  const handleEditDraft = React.useCallback((draft: DraftSummary) => {
+    setPrefill(undefined);
+    setEditDraft({ id: draft.id, accountId: draft.accountId });
+    setComposeOpen(true);
+  }, []);
+
+  // Quick row delete from the drafts list (optimistic, with spinner + revert).
+  const handleDeleteDraft = React.useCallback(
+    async (draft: DraftSummary) => {
+      setDeletingDraftIds((prev) => {
+        const next = new Set(prev);
+        next.add(draft.id);
+        return next;
+      });
+      // Optimistically drop the row; revalidate (or restore) when the call lands.
+      void mutateDrafts(
+        (current) => ({
+          drafts: (current?.drafts ?? []).filter((d) => d.id !== draft.id),
+        }),
+        { revalidate: false },
+      );
+      try {
+        await del<OkResponse>("/api/mail/drafts", {
+          accountId: draft.accountId,
+          draftId: draft.id,
+        });
+        toast.success("Draft deleted");
+        void mutateDrafts();
+      } catch (err) {
+        toast.error(
+          err instanceof FetchError
+            ? err.message
+            : "Couldn't delete the draft. Please try again.",
+        );
+        // Restore the list (the optimistic removal was wrong).
+        void mutateDrafts();
+      } finally {
+        setDeletingDraftIds((prev) => {
+          const next = new Set(prev);
+          next.delete(draft.id);
+          return next;
+        });
+      }
+    },
+    [mutateDrafts],
+  );
+
+  // Revalidate the drafts list after the dialog creates/updates/sends/deletes.
+  const handleDraftsChanged = React.useCallback(() => {
+    void mutateDrafts();
+  }, [mutateDrafts]);
+
   function handleRefresh() {
+    if (draftsView) {
+      void mutateDrafts();
+      return;
+    }
     void mutate();
   }
 
@@ -183,7 +355,7 @@ export default function InboxPage() {
         <SearchInput
           value={query}
           onChange={setQuery}
-          disabled={accountsLoading}
+          disabled={accountsLoading || draftsView}
         />
         {accountsLoading ? (
           <div className="flex gap-2 pb-3">
@@ -195,62 +367,92 @@ export default function InboxPage() {
           <AccountFilter
             accounts={accounts}
             value={filter}
-            onChange={setFilter}
+            onChange={handleFilterChange}
           />
         )}
+
+        {/* Label/folder filter — only for a single account (labels are
+            per-account). Renders as a natural second row under the accounts. */}
+        {!accountsLoading && singleAccount ? (
+          <LabelFilter
+            accountId={singleAccount.id}
+            provider={singleAccount.provider}
+            value={labelId}
+            onChange={setLabelId}
+          />
+        ) : null}
       </div>
 
-      {/* Two-pane (stacks on small screens) */}
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        {/* List pane */}
-        <section
-          aria-label="Messages"
-          className={cn(
-            "flex min-h-0 flex-col border-border md:w-[380px] md:shrink-0 md:border-r lg:w-[420px]",
-            // On mobile, hide the list when a message is open so the reader fills the screen.
-            selected ? "hidden md:flex" : "flex flex-1 md:flex-none",
-          )}
-        >
-          <MailList
-            conversations={conversations}
+      {/* Drafts view: a single full-width list (clicking opens the editor,
+          there's no reader pane). Otherwise the normal two-pane layout. */}
+      {draftsView && singleAccount ? (
+        <section aria-label="Drafts" className="flex min-h-0 flex-1 flex-col">
+          <DraftsList
+            drafts={drafts}
             accounts={accounts}
-            isLoading={isLoading || accountsLoading}
-            selectedKey={selectedKey}
-            query={debouncedQuery}
-            onSelect={handleSelect}
+            isLoading={draftsLoading || accountsLoading}
+            selectedId={editDraft && composeOpen ? editDraft.id : null}
+            onSelect={handleEditDraft}
+            onDelete={(draft) => void handleDeleteDraft(draft)}
+            deletingIds={deletingDraftIds}
           />
         </section>
-
-        {/* Reader pane */}
-        <section
-          aria-label="Message"
-          className={cn(
-            "min-h-0 min-w-0 flex-1 flex-col",
-            selected ? "flex" : "hidden md:flex",
-          )}
-        >
-          {/* Mobile back-to-list control */}
-          {selected ? (
-            <div className="shrink-0 border-b border-border p-2 md:hidden">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setSelected(null)}
-              >
-                ← Back to messages
-              </Button>
-            </div>
-          ) : null}
-          <div className="min-h-0 flex-1">
-            <MailReader
-              selected={selected}
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+          {/* List pane */}
+          <section
+            aria-label="Messages"
+            className={cn(
+              "flex min-h-0 flex-col border-border md:w-[380px] md:shrink-0 md:border-r lg:w-[420px]",
+              // On mobile, hide the list when a message is open so the reader fills the screen.
+              selected ? "hidden md:flex" : "flex flex-1 md:flex-none",
+            )}
+          >
+            <MailList
+              conversations={conversations}
               accounts={accounts}
-              onReply={handleReply}
+              isLoading={isLoading || accountsLoading}
+              selectedKey={selectedKey}
+              query={debouncedQuery}
+              currentLabelId={singleAccount ? labelId : null}
+              onSelect={handleSelect}
+              onAction={applyAction}
+              onMoved={handleMoved}
             />
-          </div>
-        </section>
-      </div>
+          </section>
+
+          {/* Reader pane */}
+          <section
+            aria-label="Message"
+            className={cn(
+              "min-h-0 min-w-0 flex-1 flex-col",
+              selected ? "flex" : "hidden md:flex",
+            )}
+          >
+            {/* Mobile back-to-list control */}
+            {selected ? (
+              <div className="shrink-0 border-b border-border p-2 md:hidden">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelected(null)}
+                >
+                  ← Back to messages
+                </Button>
+              </div>
+            ) : null}
+            <div className="min-h-0 flex-1">
+              <MailReader
+                selected={selected}
+                accounts={accounts}
+                onReply={handleReply}
+                onAction={applyAction}
+              />
+            </div>
+          </section>
+        </div>
+      )}
 
       <ComposeDialog
         open={composeOpen}
@@ -258,7 +460,10 @@ export default function InboxPage() {
         accounts={accounts}
         defaultAccountId={filter !== ALL_ACCOUNTS ? filter : undefined}
         prefill={prefill}
+        editDraftId={editDraft?.id}
+        editDraftAccountId={editDraft?.accountId}
         onSent={() => void mutate()}
+        onDraftsChanged={handleDraftsChanged}
       />
     </div>
   );

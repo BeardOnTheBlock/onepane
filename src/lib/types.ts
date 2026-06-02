@@ -4,7 +4,27 @@
 // the provider implementations, the API routes, and the UI. Keep them stable.
 // ============================================================================
 
-export type ProviderId = "google" | "microsoft";
+/** Providers that authenticate via OAuth (consent + tokens). */
+export type OAuthProviderId = "google" | "microsoft";
+
+/** Every connectable provider. "imap" = a generic IMAP/SMTP mailbox + optional
+ *  CalDAV calendar, authenticated with a username + (app) password rather than OAuth. */
+export type ProviderId = OAuthProviderId | "imap";
+
+/** Connection details for a generic IMAP/SMTP (+ optional CalDAV) account.
+ *  Stored as an encrypted JSON blob in the account's token field (no schema change). */
+export interface ImapCredentials {
+  imapHost: string;
+  imapPort: number;
+  imapSecure: boolean; // implicit TLS (usually port 993)
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean; // implicit TLS (usually port 465; false = STARTTLS on 587)
+  username: string;
+  password: string;
+  /** Optional CalDAV base URL (e.g. https://caldav.icloud.com). */
+  caldavUrl?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Accounts
@@ -99,6 +119,41 @@ export interface DownloadedAttachment {
   contentBase64: string;
 }
 
+/** A label (Gmail) or mail folder (Outlook) used to organise mail. */
+export interface MailLabel {
+  id: string;
+  name: string;
+  /** "system" = built-in (INBOX, SENT, Archive…); "user" = user-created. */
+  type: "system" | "user";
+}
+
+/** A mailbox action that can be applied to one or more messages. */
+export type MailActionType =
+  | "trash" // move to Trash / Deleted Items (recoverable)
+  | "untrash" // restore from Trash back to the inbox
+  | "archive" // remove from the inbox (kept in All Mail / Archive)
+  | "markRead"
+  | "markUnread"
+  | "star" // star (Gmail) / flag (Outlook)
+  | "unstar";
+
+/** True for actions that remove a message from the current inbox view. */
+export const REMOVES_FROM_INBOX: ReadonlySet<MailActionType> = new Set([
+  "trash",
+  "archive",
+]);
+
+/** The inverse action used to power "Undo" on a destructive action. */
+export const INVERSE_ACTION: Partial<Record<MailActionType, MailActionType>> = {
+  trash: "untrash",
+  untrash: "trash",
+  markRead: "markUnread",
+  markUnread: "markRead",
+  star: "unstar",
+  unstar: "star",
+  // archive has no clean one-call inverse across providers; handled in the UI.
+};
+
 /** A new outgoing message. */
 export interface MailDraft {
   to: MailAddress[];
@@ -107,6 +162,28 @@ export interface MailDraft {
   bodyText: string;
   bodyHtml?: string;
   attachments?: OutgoingAttachment[];
+}
+
+/** A saved (unsent) draft as shown in the drafts list. */
+export interface DraftSummary {
+  /** Provider draft id (used to edit/send/delete — distinct from a message id). */
+  id: string;
+  accountId: string;
+  provider: ProviderId;
+  to: MailAddress[];
+  subject: string;
+  snippet: string;
+  updatedAt: string; // ISO
+}
+
+/** The editable content of a saved draft. */
+export interface DraftContent {
+  id: string;
+  to: MailAddress[];
+  cc: MailAddress[];
+  subject: string;
+  bodyText: string;
+  bodyHtml: string | null;
 }
 
 /** Threading context supplied when a draft is a reply to an existing message. */
@@ -135,10 +212,26 @@ export interface EventAttendee {
 
 export type ConferenceType = "none" | "google_meet" | "ms_teams";
 
+/** One of an account's calendars. */
+export interface CalendarInfo {
+  id: string;
+  accountId: string;
+  provider: ProviderId;
+  name: string;
+  /** Hex colour from the provider, if any. */
+  color: string | null;
+  /** The account's default/primary calendar. */
+  primary: boolean;
+  /** Whether the user can create/edit events on it (owner/writer). */
+  canEdit: boolean;
+}
+
 /** A calendar event as shown in the unified calendar. */
 export interface UnifiedEvent {
   id: string;
   accountId: string;
+  /** The calendar this event belongs to (needed to edit/delete it). */
+  calendarId: string;
   provider: ProviderId;
   title: string;
   description: string | null;
@@ -174,6 +267,8 @@ export interface EventDraft {
   physicalLocation?: string;
   /** Required when locationType === "conference". */
   conferenceType?: ConferenceType;
+  /** Which calendar to create/update the event in (defaults to primary). */
+  calendarId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,13 +281,25 @@ export interface DateRange {
 }
 
 export interface MailProvider {
-  /** Lists inbox messages. When `query` is provided, performs a full-text
-   *  search across the mailbox instead of listing the inbox. */
+  /** Lists messages. With `query`, performs a full-text search; with `labelId`,
+   *  lists messages in that label/folder; otherwise lists the inbox. */
   listMessages(
     account: AccountWithTokens,
     limit: number,
     query?: string,
+    labelId?: string,
   ): Promise<UnifiedMessage[]>;
+  /** Lists the account's labels (Gmail) / mail folders (Outlook). */
+  listLabels(account: AccountWithTokens): Promise<MailLabel[]>;
+  /** Creates a new user label/folder and returns it. */
+  createLabel(account: AccountWithTokens, name: string): Promise<MailLabel>;
+  /** Moves messages into a label/folder (Gmail: applies the label and removes
+   *  them from the inbox; Outlook: moves them to the folder). */
+  moveToLabel(
+    account: AccountWithTokens,
+    messageIds: string[],
+    labelId: string,
+  ): Promise<void>;
   getMessage(
     account: AccountWithTokens,
     messageId: string,
@@ -208,6 +315,32 @@ export interface MailProvider {
     messageId: string,
     attachmentId: string,
   ): Promise<DownloadedAttachment>;
+  /** Applies a triage action (trash/archive/read/star) to one or more messages. */
+  applyAction(
+    account: AccountWithTokens,
+    messageIds: string[],
+    action: MailActionType,
+  ): Promise<void>;
+  /** Lists saved (unsent) drafts. */
+  listDrafts(account: AccountWithTokens, limit: number): Promise<DraftSummary[]>;
+  /** Loads a draft's editable content. */
+  getDraft(account: AccountWithTokens, draftId: string): Promise<DraftContent>;
+  /** Creates a draft from a MailDraft; returns the new draft id. */
+  createDraft(
+    account: AccountWithTokens,
+    draft: MailDraft,
+    reply?: ReplyContext,
+  ): Promise<string>;
+  /** Replaces a draft's content. */
+  updateDraft(
+    account: AccountWithTokens,
+    draftId: string,
+    draft: MailDraft,
+  ): Promise<void>;
+  /** Sends a saved draft. */
+  sendDraft(account: AccountWithTokens, draftId: string): Promise<void>;
+  /** Deletes a saved draft. */
+  deleteDraft(account: AccountWithTokens, draftId: string): Promise<void>;
   sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
@@ -216,14 +349,39 @@ export interface MailProvider {
 }
 
 export interface CalendarProvider {
+  /** Lists the account's calendars. */
+  listCalendars(account: AccountWithTokens): Promise<CalendarInfo[]>;
+  /** Lists events in a range. When calendarId is omitted, uses the primary calendar. */
   listEvents(
     account: AccountWithTokens,
     range: DateRange,
+    calendarId?: string,
   ): Promise<UnifiedEvent[]>;
+  /** Creates an event (in draft.calendarId, or the primary calendar). */
   createEvent(
     account: AccountWithTokens,
     draft: EventDraft,
   ): Promise<UnifiedEvent>;
+  /** Updates an existing event. */
+  updateEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    draft: EventDraft,
+    calendarId?: string,
+  ): Promise<UnifiedEvent>;
+  /** Deletes an event (cancels + notifies attendees). */
+  deleteEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    calendarId?: string,
+  ): Promise<void>;
+  /** RSVPs to an invitation (accepted / declined / tentative). */
+  respondToEvent(
+    account: AccountWithTokens,
+    eventId: string,
+    response: AttendeeResponse,
+    calendarId?: string,
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -256,8 +414,29 @@ export interface MailThreadResponse {
   messages: UnifiedMessageFull[];
 }
 
+export interface MailLabelsResponse {
+  labels: MailLabel[];
+}
+
+export interface DraftsListResponse {
+  drafts: DraftSummary[];
+}
+
+export interface DraftResponse {
+  draft: DraftContent;
+}
+
+export interface CreateDraftResponse {
+  draftId: string;
+}
+
 export interface CalendarListResponse {
   events: UnifiedEvent[];
+  errors: AccountError[];
+}
+
+export interface CalendarsResponse {
+  calendars: CalendarInfo[];
   errors: AccountError[];
 }
 

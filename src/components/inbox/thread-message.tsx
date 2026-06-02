@@ -5,9 +5,14 @@ import { ChevronDown } from "lucide-react";
 
 import { AccountDot } from "@/components/account-dot";
 import { AttachmentList } from "@/components/inbox/attachment-list";
+import { MessageActions } from "@/components/inbox/message-actions";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn, formatAddress, initials } from "@/lib/utils";
-import type { AccountPublic, UnifiedMessageFull } from "@/lib/types";
+import type {
+  AccountPublic,
+  MailActionType,
+  UnifiedMessageFull,
+} from "@/lib/types";
 
 export interface ThreadMessageProps {
   message: UnifiedMessageFull;
@@ -15,6 +20,8 @@ export interface ThreadMessageProps {
   account: AccountPublic | undefined;
   expanded: boolean;
   onToggle: () => void;
+  /** Apply a triage action to just this message. Omit to hide per-message actions. */
+  onAction?: (action: MailActionType) => void;
 }
 
 function dateLabel(iso: string): string {
@@ -85,10 +92,22 @@ function ThreadMessageComponent({
   account,
   expanded,
   onToggle,
+  onAction,
 }: ThreadMessageProps) {
   const senderLabel = message.from.name?.trim() || message.from.email;
   const when = dateLabel(message.date);
   const avatarColor = account?.color ?? "hsl(var(--muted-foreground))";
+
+  // No starred flag on the message model — track per-message star locally.
+  const [starred, setStarred] = React.useState(false);
+  const handleAction = React.useCallback(
+    (action: MailActionType) => {
+      if (action === "star") setStarred(true);
+      if (action === "unstar") setStarred(false);
+      onAction?.(action);
+    },
+    [onAction],
+  );
 
   return (
     <article
@@ -161,9 +180,18 @@ function ThreadMessageComponent({
           <div className="flex flex-col gap-0.5 px-4 py-2">
             <div className="mb-1 flex items-center gap-2">
               <AccountDot color={avatarColor} size="sm" />
-              <span className="min-w-0 truncate text-xs text-muted-foreground">
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {account?.email ?? ""}
               </span>
+              {onAction ? (
+                <MessageActions
+                  unread={message.unread}
+                  starred={starred}
+                  onAction={handleAction}
+                  size="sm"
+                  className="shrink-0"
+                />
+              ) : null}
             </div>
             <AddressLine label="From" addresses={[message.from]} />
             <AddressLine label="To" addresses={message.to} />
