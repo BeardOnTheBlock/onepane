@@ -19,6 +19,7 @@ import type {
   DownloadedAttachment,
   EventAttendee,
   EventDraft,
+  MailActionType,
   MailAddress,
   MailDraft,
   MailProvider,
@@ -440,6 +441,65 @@ export const googleMailProvider: MailProvider = {
     };
   },
 
+  async applyAction(
+    account: AccountWithTokens,
+    messageIds: string[],
+    action: MailActionType,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    switch (action) {
+      // trash/untrash have no batch endpoint, so fan out one call per id.
+      // These return the modified message resource (which we ignore).
+      case "trash":
+        await Promise.all(
+          messageIds.map((id) =>
+            gfetch(
+              `${GMAIL_BASE}/messages/${encodeURIComponent(id)}/trash`,
+              account.accessToken,
+              { method: "POST" },
+            ),
+          ),
+        );
+        return;
+      case "untrash":
+        await Promise.all(
+          messageIds.map((id) =>
+            gfetch(
+              `${GMAIL_BASE}/messages/${encodeURIComponent(id)}/untrash`,
+              account.accessToken,
+              { method: "POST" },
+            ),
+          ),
+        );
+        return;
+      // Label changes go through batchModify in a single call. It returns 204
+      // with no body, so we use gfetch (not gfetchJson) and discard the result.
+      case "archive":
+        await batchModify(account, messageIds, { removeLabelIds: ["INBOX"] });
+        return;
+      case "markRead":
+        await batchModify(account, messageIds, { removeLabelIds: ["UNREAD"] });
+        return;
+      case "markUnread":
+        await batchModify(account, messageIds, { addLabelIds: ["UNREAD"] });
+        return;
+      case "star":
+        await batchModify(account, messageIds, { addLabelIds: ["STARRED"] });
+        return;
+      case "unstar":
+        await batchModify(account, messageIds, {
+          removeLabelIds: ["STARRED"],
+        });
+        return;
+      default: {
+        // Exhaustiveness check: a new MailActionType must be handled above.
+        const exhaustive: never = action;
+        throw new Error(`Unsupported mail action: ${String(exhaustive)}`);
+      }
+    }
+  },
+
   async sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,
@@ -555,6 +615,22 @@ function findAttachmentPart(
 /** Renders a MailAddress for an RFC 2822 header value. */
 function formatHeaderAddress(addr: MailAddress): string {
   return addr.name ? `${addr.name} <${addr.email}>` : addr.email;
+}
+
+/**
+ * Adds and/or removes labels on a batch of messages via the Gmail
+ * batchModify endpoint (a single request). batchModify responds with 204 and
+ * no body, so we use gfetch rather than gfetchJson and discard the response.
+ */
+async function batchModify(
+  account: AccountWithTokens,
+  messageIds: string[],
+  labels: { addLabelIds?: string[]; removeLabelIds?: string[] },
+): Promise<void> {
+  await gfetch(`${GMAIL_BASE}/messages/batchModify`, account.accessToken, {
+    method: "POST",
+    body: JSON.stringify({ ids: messageIds, ...labels }),
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -99,6 +99,33 @@ export interface DownloadedAttachment {
   contentBase64: string;
 }
 
+/** A mailbox action that can be applied to one or more messages. */
+export type MailActionType =
+  | "trash" // move to Trash / Deleted Items (recoverable)
+  | "untrash" // restore from Trash back to the inbox
+  | "archive" // remove from the inbox (kept in All Mail / Archive)
+  | "markRead"
+  | "markUnread"
+  | "star" // star (Gmail) / flag (Outlook)
+  | "unstar";
+
+/** True for actions that remove a message from the current inbox view. */
+export const REMOVES_FROM_INBOX: ReadonlySet<MailActionType> = new Set([
+  "trash",
+  "archive",
+]);
+
+/** The inverse action used to power "Undo" on a destructive action. */
+export const INVERSE_ACTION: Partial<Record<MailActionType, MailActionType>> = {
+  trash: "untrash",
+  untrash: "trash",
+  markRead: "markUnread",
+  markUnread: "markRead",
+  star: "unstar",
+  unstar: "star",
+  // archive has no clean one-call inverse across providers; handled in the UI.
+};
+
 /** A new outgoing message. */
 export interface MailDraft {
   to: MailAddress[];
@@ -208,6 +235,12 @@ export interface MailProvider {
     messageId: string,
     attachmentId: string,
   ): Promise<DownloadedAttachment>;
+  /** Applies a triage action (trash/archive/read/star) to one or more messages. */
+  applyAction(
+    account: AccountWithTokens,
+    messageIds: string[],
+    action: MailActionType,
+  ): Promise<void>;
   sendMessage(
     account: AccountWithTokens,
     draft: MailDraft,

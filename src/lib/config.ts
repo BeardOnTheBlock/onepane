@@ -17,10 +17,11 @@ export const GOOGLE_SCOPES = [
   "openid",
   "email",
   "profile",
-  "https://www.googleapis.com/auth/gmail.readonly",
-  "https://www.googleapis.com/auth/gmail.send",
-  "https://www.googleapis.com/auth/calendar.events",
-  "https://www.googleapis.com/auth/calendar.readonly",
+  // gmail.modify covers read, send, trash/archive, labels, and drafts —
+  // everything a mail client does except permanent (bypass-Trash) deletion.
+  "https://www.googleapis.com/auth/gmail.modify",
+  // Full calendar: read/write across all of the account's calendars + events.
+  "https://www.googleapis.com/auth/calendar",
 ];
 
 export const MICROSOFT_SCOPES = [
@@ -29,7 +30,8 @@ export const MICROSOFT_SCOPES = [
   "profile",
   "offline_access",
   "User.Read",
-  "Mail.Read",
+  // Mail.ReadWrite = read/write/move/delete/draft; Mail.Send = send.
+  "Mail.ReadWrite",
   "Mail.Send",
   "Calendars.ReadWrite",
   "OnlineMeetings.ReadWrite",

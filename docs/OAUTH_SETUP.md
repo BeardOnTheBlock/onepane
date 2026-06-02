@@ -45,14 +45,17 @@ In the selected project, enable both APIs (APIs & Services → Library, search a
 1. Go to **APIs & Services → OAuth consent screen**.
 2. Choose **User type: External** and click **Create**.
 3. Fill in the required fields (app name, your support email, developer contact email).
-4. On the **Scopes** step, add the scopes OnePane requests:
-   - `.../auth/gmail.readonly`
-   - `.../auth/gmail.send`
-   - `.../auth/calendar.events`
-   - `.../auth/calendar.readonly`
+4. On the **Scopes** step, add the scopes OnePane requests. **These only appear in the
+   picker after you've enabled the Gmail API and Google Calendar API (previous step)** — if
+   the list shows only `openid`/`email`/`profile`, go back and enable both APIs, or use the
+   **"Manually add scopes"** box and paste the URLs below.
+   - `https://www.googleapis.com/auth/gmail.modify` — read, send, archive, delete (to Trash),
+     labels, and drafts (everything a mail client does except permanent deletion)
+   - `https://www.googleapis.com/auth/calendar` — full read/write across your calendars + events
 
    (OnePane also requests the standard `openid`, `email`, and `profile` scopes to read your
-   address and name.)
+   address and name. These two scopes are Google "restricted" scopes; in **Testing** mode you,
+   as a listed test user, can use them and simply click past the "unverified app" screen.)
 5. On the **Test users** step, **add your own Google account** as a test user. While the app
    is in "Testing" mode, only listed test users can connect — which is exactly what you want
    for a personal, local-first tool.
@@ -117,7 +120,7 @@ Go to **API permissions → Add a permission → Microsoft Graph → Delegated p
 add each of these:
 
 - `User.Read`
-- `Mail.Read`
+- `Mail.ReadWrite` (read, write, move, delete, and draft mail)
 - `Mail.Send`
 - `Calendars.ReadWrite`
 - `OnlineMeetings.ReadWrite`
