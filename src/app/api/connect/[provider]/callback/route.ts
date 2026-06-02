@@ -10,6 +10,7 @@ import { NextResponse } from "next/server";
 import { upsertAccount } from "@/lib/accounts";
 import { ALL_PROVIDERS, OAUTH_STATE_COOKIE } from "@/lib/config";
 import { exchangeCodeForTokens, fetchProfile } from "@/lib/oauth";
+import { requireUserId } from "@/lib/session";
 import type { OAuthProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -39,6 +40,15 @@ export async function GET(
 
   // Always clear the one-time state cookie, whatever the outcome.
   const clearState = () => cookieStore.delete(OAUTH_STATE_COOKIE);
+
+  // The new mailbox is attached to the SIGNED-IN user. Without a session there
+  // is no owner to attach it to — bounce to the login page (and drop the
+  // one-time state cookie so it can't be replayed).
+  const userId = await requireUserId();
+  if (!userId) {
+    clearState();
+    return NextResponse.redirect(new URL("/login", req.url));
+  }
 
   if (!isProviderId(provider)) {
     clearState();
@@ -75,6 +85,7 @@ export async function GET(
     const profile = await fetchProfile(provider, tokens.accessToken);
 
     await upsertAccount({
+      userId,
       provider,
       email: profile.email,
       displayName: profile.displayName,

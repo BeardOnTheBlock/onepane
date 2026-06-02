@@ -80,7 +80,13 @@ export function ConnectAccountCard({
   const [dialogOpen, setDialogOpen] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
 
-  const configured = Boolean(status?.configured);
+  // Hosted mode: the operator configures a single central OAuth client via env
+  // vars, so users never enter their own Client ID/Secret. We hide the whole
+  // credential-entry path and always present a plain "Connect {Provider}"
+  // button (the consent flow uses the central client).
+  const hosted = process.env.NEXT_PUBLIC_ONEPANE_HOSTED === "true";
+
+  const configured = hosted || Boolean(status?.configured);
 
   async function handleRemove() {
     setRemoving(true);
@@ -116,7 +122,18 @@ export function ConnectAccountCard({
         </div>
       </div>
 
-      {isLoading || !status ? (
+      {hosted ? (
+        // Hosted: just the Connect button — central client, no credential entry.
+        <div className="mt-auto flex flex-col gap-2">
+          {/* OAuth redirect — must be a real navigation, not fetch(). */}
+          <Button asChild className="w-full">
+            <a href={`/api/connect/${provider}`}>
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              Connect {meta.label}
+            </a>
+          </Button>
+        </div>
+      ) : isLoading || !status ? (
         <Skeleton className="mt-auto h-9 w-full" />
       ) : configured ? (
         <div className="mt-auto flex flex-col gap-2">

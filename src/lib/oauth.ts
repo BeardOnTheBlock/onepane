@@ -229,7 +229,7 @@ export async function getValidAccessToken(
     account.provider,
     account.refreshToken,
   );
-  await updateAccountTokens(account.id, {
+  await updateAccountTokens(account.userId, account.id, {
     accessToken: refreshed.accessToken,
     refreshToken: refreshed.refreshToken,
     tokenExpiry: refreshed.expiry,

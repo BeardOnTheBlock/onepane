@@ -90,6 +90,8 @@ function LoadErrorState({ message }: { message: string }) {
   );
 }
 
+const HOSTED = process.env.NEXT_PUBLIC_ONEPANE_HOSTED === "true";
+
 export default function SettingsPage() {
   const { accounts, isLoading, error, mutate } = useAccounts();
   const {
@@ -125,9 +127,9 @@ export default function SettingsPage() {
             Connect an account
           </h2>
           <p className="mb-4 text-sm text-muted-foreground">
-            Add each provider&rsquo;s OAuth Client ID &amp; Secret (stored
-            encrypted on this machine), then run the consent flow. Tokens are
-            stored encrypted here only.
+            {HOSTED
+              ? "Connect a Google or Microsoft account to bring its mail and calendar into OnePane. Your tokens are stored encrypted and scoped to your account only."
+              : "Add each provider’s OAuth Client ID & Secret (stored encrypted on this machine), then run the consent flow. Tokens are stored encrypted here only."}
           </p>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <ConnectAccountCard

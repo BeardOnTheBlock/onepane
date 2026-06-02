@@ -5,6 +5,7 @@
 import { getAccountWithTokens } from "@/lib/accounts";
 import { getValidAccessToken } from "@/lib/oauth";
 import { getMailProvider } from "@/lib/providers";
+import { requireUserId } from "@/lib/session";
 import type { MailActionType } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -41,6 +42,9 @@ function isNonEmptyStringArray(value: unknown): value is string[] {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   let body: unknown;
   try {
     body = await req.json();
@@ -67,7 +71,7 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   try {
-    const account = await getAccountWithTokens(accountId);
+    const account = await getAccountWithTokens(userId, accountId);
     if (!account) {
       return Response.json({ error: "Account not found." }, { status: 404 });
     }
