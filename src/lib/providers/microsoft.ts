@@ -23,6 +23,7 @@ import type {
   MailActionType,
   MailAddress,
   MailDraft,
+  MailLabel,
   MailProvider,
   ReplyContext,
   UnifiedEvent,
@@ -152,6 +153,14 @@ interface GraphEvent {
   webLink?: string | null;
 }
 
+interface GraphMailFolder {
+  id?: string | null;
+  displayName?: string | null;
+  /** Present on modern tenants for built-in folders (e.g. "inbox", "archive");
+   *  may be absent on older tenants, so we also match well-known names. */
+  wellKnownName?: string | null;
+}
+
 interface GraphList<T> {
   value?: T[] | null;
 }
@@ -215,6 +224,32 @@ function toAttachmentMetas(
     });
   }
   return out;
+}
+
+/** Display names of Outlook's built-in folders, used to classify a folder as
+ *  "system" when the tenant doesn't report a wellKnownName. Compared
+ *  case-insensitively. */
+const WELL_KNOWN_FOLDER_NAMES: ReadonlySet<string> = new Set(
+  [
+    "Inbox",
+    "Drafts",
+    "Sent Items",
+    "Deleted Items",
+    "Archive",
+    "Junk Email",
+    "Outbox",
+    "Conversation History",
+  ].map((n) => n.toLowerCase()),
+);
+
+/** Map a Graph mail folder to our MailLabel, classifying system vs user. */
+function mapMailFolder(f: GraphMailFolder): MailLabel | null {
+  if (!f.id) return null;
+  const name = f.displayName ?? "";
+  const isSystem =
+    Boolean(f.wellKnownName) ||
+    WELL_KNOWN_FOLDER_NAMES.has(name.trim().toLowerCase());
+  return { id: f.id, name, type: isSystem ? "system" : "user" };
 }
 
 /** Map a Graph message to the unified inbox-list shape. */
@@ -355,34 +390,105 @@ export const microsoftMailProvider: MailProvider = {
     account: AccountWithTokens,
     limit: number,
     query?: string,
+    labelId?: string,
   ): Promise<UnifiedMessage[]> {
     const select =
       "id,conversationId,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview";
     const trimmed = query?.trim() ?? "";
+    const folder = labelId?.trim() ?? "";
+    const top = `$top=${encodeURIComponent(String(limit))}`;
+    const selectParam = `$select=${encodeURIComponent(select)}`;
+    const orderby = `$orderby=${encodeURIComponent("receivedDateTime desc")}`;
+    // Graph forbids combining $search with $orderby; escape embedded quotes.
+    const searchParam = trimmed
+      ? `$search=${encodeURIComponent(`"${trimmed.replace(/"/g, '\\"')}"`)}`
+      : "";
 
     let url: string;
-    if (trimmed) {
-      // Full-text search across the whole mailbox. Graph forbids combining
-      // $search with $orderby, so we drop $orderby and take results by
-      // relevance. Escape any embedded double-quotes in the search term.
-      const escaped = trimmed.replace(/"/g, '\\"');
-      url =
-        `${GRAPH_BASE}/me/messages` +
-        `?$top=${encodeURIComponent(String(limit))}` +
-        `&$search=${encodeURIComponent(`"${escaped}"`)}` +
-        `&$select=${encodeURIComponent(select)}`;
+    if (folder) {
+      // Messages within a specific folder. With a search term we drop $orderby
+      // (Graph rejects $search + $orderby); otherwise sort newest first.
+      const base = `${GRAPH_BASE}/me/mailFolders/${encodeURIComponent(
+        folder,
+      )}/messages`;
+      const params = trimmed
+        ? [top, searchParam, selectParam]
+        : [top, orderby, selectParam];
+      url = `${base}?${params.join("&")}`;
+    } else if (trimmed) {
+      // Full-text search across the whole mailbox, by relevance.
+      url = `${GRAPH_BASE}/me/messages?${[top, searchParam, selectParam].join(
+        "&",
+      )}`;
     } else {
       // Default inbox listing, newest first.
-      url =
-        `${GRAPH_BASE}/me/mailFolders/inbox/messages` +
-        `?$top=${encodeURIComponent(String(limit))}` +
-        `&$orderby=${encodeURIComponent("receivedDateTime desc")}` +
-        `&$select=${encodeURIComponent(select)}`;
+      url = `${GRAPH_BASE}/me/mailFolders/inbox/messages?${[
+        top,
+        orderby,
+        selectParam,
+      ].join("&")}`;
     }
 
     const res = await gfetch(url, account.accessToken);
     const data = (await res.json()) as GraphList<GraphMessage>;
     return (data.value ?? []).map((m) => mapMessage(account, m));
+  },
+
+  async listLabels(account: AccountWithTokens): Promise<MailLabel[]> {
+    const select = "id,displayName,wellKnownName";
+    const url =
+      `${GRAPH_BASE}/me/mailFolders` +
+      `?$top=100` +
+      `&$select=${encodeURIComponent(select)}`;
+
+    const res = await gfetch(url, account.accessToken);
+    const data = (await res.json()) as GraphList<GraphMailFolder>;
+
+    const labels: MailLabel[] = [];
+    for (const f of data.value ?? []) {
+      const label = mapMailFolder(f);
+      if (label) labels.push(label);
+    }
+
+    // System folders first, then alphabetical (case-insensitive) within group.
+    labels.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "system" ? -1 : 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+    return labels;
+  },
+
+  async createLabel(
+    account: AccountWithTokens,
+    name: string,
+  ): Promise<MailLabel> {
+    const res = await gfetch(`${GRAPH_BASE}/me/mailFolders`, account.accessToken, {
+      method: "POST",
+      body: JSON.stringify({ displayName: name }),
+    });
+    const created = (await res.json()) as GraphMailFolder;
+    return {
+      id: created.id ?? "",
+      name: created.displayName ?? name,
+      type: "user",
+    };
+  },
+
+  async moveToLabel(
+    account: AccountWithTokens,
+    messageIds: string[],
+    labelId: string,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+    await Promise.all(
+      messageIds.map((id) =>
+        gfetch(
+          `${GRAPH_BASE}/me/messages/${encodeURIComponent(id)}/move`,
+          account.accessToken,
+          { method: "POST", body: JSON.stringify({ destinationId: labelId }) },
+        ),
+      ),
+    );
   },
 
   async getMessage(

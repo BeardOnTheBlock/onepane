@@ -36,6 +36,13 @@ export async function GET(req: Request): Promise<Response> {
   const limit = clampLimit(searchParams.get("limit"));
   const rawQuery = searchParams.get("q")?.trim();
   const query = rawQuery && rawQuery.length ? rawQuery : undefined;
+  const rawLabelId = searchParams.get("labelId")?.trim();
+  // Labels are per-account, so only honour labelId for a single account; when
+  // aggregating across "all" accounts we ignore it.
+  const labelId =
+    accountId !== "all" && rawLabelId && rawLabelId.length
+      ? rawLabelId
+      : undefined;
 
   // Resolve the set of accounts to query.
   let accounts: AccountWithTokens[];
@@ -63,6 +70,7 @@ export async function GET(req: Request): Promise<Response> {
           account,
           limit,
           query,
+          labelId,
         );
       } catch (err) {
         errors.push({

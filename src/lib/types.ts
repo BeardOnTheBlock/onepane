@@ -99,6 +99,14 @@ export interface DownloadedAttachment {
   contentBase64: string;
 }
 
+/** A label (Gmail) or mail folder (Outlook) used to organise mail. */
+export interface MailLabel {
+  id: string;
+  name: string;
+  /** "system" = built-in (INBOX, SENT, Archive…); "user" = user-created. */
+  type: "system" | "user";
+}
+
 /** A mailbox action that can be applied to one or more messages. */
 export type MailActionType =
   | "trash" // move to Trash / Deleted Items (recoverable)
@@ -213,13 +221,25 @@ export interface DateRange {
 }
 
 export interface MailProvider {
-  /** Lists inbox messages. When `query` is provided, performs a full-text
-   *  search across the mailbox instead of listing the inbox. */
+  /** Lists messages. With `query`, performs a full-text search; with `labelId`,
+   *  lists messages in that label/folder; otherwise lists the inbox. */
   listMessages(
     account: AccountWithTokens,
     limit: number,
     query?: string,
+    labelId?: string,
   ): Promise<UnifiedMessage[]>;
+  /** Lists the account's labels (Gmail) / mail folders (Outlook). */
+  listLabels(account: AccountWithTokens): Promise<MailLabel[]>;
+  /** Creates a new user label/folder and returns it. */
+  createLabel(account: AccountWithTokens, name: string): Promise<MailLabel>;
+  /** Moves messages into a label/folder (Gmail: applies the label and removes
+   *  them from the inbox; Outlook: moves them to the folder). */
+  moveToLabel(
+    account: AccountWithTokens,
+    messageIds: string[],
+    labelId: string,
+  ): Promise<void>;
   getMessage(
     account: AccountWithTokens,
     messageId: string,
@@ -287,6 +307,10 @@ export interface MailMessageResponse {
 export interface MailThreadResponse {
   /** Every message in the conversation, oldest first. */
   messages: UnifiedMessageFull[];
+}
+
+export interface MailLabelsResponse {
+  labels: MailLabel[];
 }
 
 export interface CalendarListResponse {
