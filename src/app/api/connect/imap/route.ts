@@ -18,6 +18,7 @@ import { NextResponse } from "next/server";
 
 import { upsertAccount } from "@/lib/accounts";
 import { serializeImapCredentials } from "@/lib/imap-credentials";
+import { requireUserId } from "@/lib/session";
 import type { ImapCredentials } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -116,6 +117,13 @@ async function verifyImapLogin(creds: ImapCredentials): Promise<void> {
 }
 
 export async function POST(req: Request): Promise<NextResponse> {
+  // ---- Require a signed-in user -----------------------------------------
+  // The verified mailbox is attached to the session user; no session => 401.
+  const userId = await requireUserId();
+  if (!userId) {
+    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+  }
+
   // ---- Parse body --------------------------------------------------------
   let body: unknown;
   try {
@@ -184,6 +192,7 @@ export async function POST(req: Request): Promise<NextResponse> {
     const farFutureExpiry = new Date("9999-12-31T23:59:59.999Z");
 
     await upsertAccount({
+      userId,
       provider: "imap",
       email,
       displayName: email,

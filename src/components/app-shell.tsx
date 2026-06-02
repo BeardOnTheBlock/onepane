@@ -4,10 +4,12 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { signOut, useSession } from "next-auth/react";
 import {
   Calendar,
   Columns3,
   Inbox,
+  LogOut,
   Menu,
   Plus,
   Settings,
@@ -16,6 +18,7 @@ import {
 } from "lucide-react";
 
 import { AccountDot } from "@/components/account-dot";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAccounts } from "@/hooks/use-accounts";
@@ -161,6 +164,88 @@ function AccountsSection({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
+// Signed-in user + sign out (sidebar footer)
+// ---------------------------------------------------------------------------
+
+/** Initials fallback for the avatar when there's no image. */
+function initialsFrom(name?: string | null, email?: string | null): string {
+  const source = (name ?? email ?? "").trim();
+  if (!source) return "?";
+  const parts = source.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return source.slice(0, 2).toUpperCase();
+}
+
+function UserMenu() {
+  const { data: session, status } = useSession();
+
+  if (status === "loading") {
+    return (
+      <div className="flex items-center gap-2.5 px-3 py-2">
+        <Skeleton className="h-8 w-8 shrink-0 rounded-full" />
+        <div className="min-w-0 flex-1 space-y-1.5">
+          <Skeleton className="h-3.5 w-28" />
+          <Skeleton className="h-3 w-36" />
+        </div>
+      </div>
+    );
+  }
+
+  const user = session?.user;
+  if (!user) return null;
+
+  const label = user.name ?? user.email ?? "Signed in";
+  const initials = initialsFrom(user.name, user.email);
+
+  return (
+    <div className="flex items-center gap-2.5 px-3 py-2">
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-xs font-medium text-secondary-foreground">
+        {user.image ? (
+          // Avatars come from the OAuth provider's CDN; a plain <img> avoids
+          // next/image domain config and keeps this purely client-side.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={user.image}
+            alt=""
+            className="h-full w-full object-cover"
+            referrerPolicy="no-referrer"
+          />
+        ) : (
+          <span aria-hidden="true">{initials}</span>
+        )}
+      </span>
+
+      <div className="min-w-0 flex-1 leading-tight">
+        <p className="truncate text-sm font-medium" title={label}>
+          {user.name ?? user.email}
+        </p>
+        {user.name && user.email ? (
+          <p className="truncate text-xs text-muted-foreground" title={user.email}>
+            {user.email}
+          </p>
+        ) : null}
+      </div>
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+        title="Sign out"
+        onClick={() => {
+          void signOut({ callbackUrl: "/login" });
+        }}
+      >
+        <LogOut className="h-4 w-4" aria-hidden="true" />
+        <span className="sr-only">Sign out</span>
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Shared sidebar body (used by both the fixed desktop rail and mobile drawer)
 // ---------------------------------------------------------------------------
 
@@ -181,6 +266,8 @@ function SidebarBody({
       </div>
       <div className="mx-2 mt-1 border-t border-border" />
       <AccountsSection onNavigate={onNavigate} />
+      <div className="mx-2 border-t border-border" />
+      <UserMenu />
     </div>
   );
 }
@@ -239,6 +326,11 @@ function MobileNav({ pathname }: { pathname: string }) {
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
+
+  // The login screen is a standalone, full-bleed page — no sidebar/nav chrome.
+  if (pathname === "/login") {
+    return <>{children}</>;
+  }
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">

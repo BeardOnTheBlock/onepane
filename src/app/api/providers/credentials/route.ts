@@ -10,6 +10,7 @@ import {
   deleteStoredCredential,
   setStoredCredential,
 } from "@/lib/provider-credentials";
+import { requireUserId } from "@/lib/session";
 import type { OAuthProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -24,6 +25,9 @@ function badRequest(message: string): Response {
 }
 
 export async function GET(): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   const entries = await Promise.all(
     ALL_PROVIDERS.map(async (p) => [p, await getProviderCredentialStatus(p)] as const),
   );
@@ -31,6 +35,9 @@ export async function GET(): Promise<Response> {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   let body: unknown;
   try {
     body = await req.json();
@@ -64,6 +71,9 @@ export async function POST(req: Request): Promise<Response> {
 }
 
 export async function DELETE(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   const { searchParams } = new URL(req.url);
   const provider = searchParams.get("provider");
   if (!isProviderId(provider)) return badRequest("Unknown or missing 'provider'.");

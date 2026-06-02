@@ -10,6 +10,7 @@ import {
 } from "@/lib/accounts";
 import { getValidAccessToken } from "@/lib/oauth";
 import { getMailProvider } from "@/lib/providers";
+import { requireUserId } from "@/lib/session";
 import type {
   AccountError,
   AccountWithTokens,
@@ -31,6 +32,9 @@ function clampLimit(raw: string | null): number {
 }
 
 export async function GET(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   const { searchParams } = new URL(req.url);
   const accountId = searchParams.get("accountId") ?? "all";
   const limit = clampLimit(searchParams.get("limit"));
@@ -48,9 +52,9 @@ export async function GET(req: Request): Promise<Response> {
   let accounts: AccountWithTokens[];
   try {
     if (accountId === "all") {
-      accounts = await listAccountsWithTokens();
+      accounts = await listAccountsWithTokens(userId);
     } else {
-      const account = await getAccountWithTokens(accountId);
+      const account = await getAccountWithTokens(userId, accountId);
       if (!account) {
         return Response.json({ error: "Account not found." }, { status: 404 });
       }

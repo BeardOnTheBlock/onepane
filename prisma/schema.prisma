@@ -1,47 +1,58 @@
-// OnePane local database schema.
-// SQLite keeps everything on your machine; OAuth tokens are encrypted at rest
-// (AES-256-GCM) by the application layer before they are written here.
+// OnePane hosted (multi-user) database schema.
+// Postgres for multi-tenant use; every connected mailbox/calendar is owned by a
+// User. OAuth/IMAP tokens are encrypted at rest (AES-256-GCM) by the app layer
+// before they are written here.
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// A connected email/calendar account (one row per Google/Microsoft login).
+// An app user (created on first "Sign in with Google"). Identity only.
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  name      String?
+  image     String?
+  createdAt DateTime  @default(now())
+  accounts  Account[]
+}
+
+// A connected email/calendar account, owned by exactly one User.
 model Account {
-  id          String   @id @default(cuid())
-  provider    String // "google" | "microsoft"
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  provider    String // "google" | "microsoft" | "imap"
   email       String
   displayName String?
-  // Hex color used to colour-code this account across the inbox + calendar UI.
-  color       String   @default("#6366f1")
-  // Whether the account can host Microsoft Teams meetings (work/school accounts).
-  canTeams    Boolean  @default(false)
-  // Whether the account can create Google Meet links (all Google accounts).
-  canMeet     Boolean  @default(false)
+  color       String  @default("#6366f1")
+  canTeams    Boolean @default(false)
+  canMeet     Boolean @default(false)
 
   // --- Encrypted secrets (AES-256-GCM, "iv:tag:ciphertext" base64) ---
   accessToken  String
   refreshToken String?
 
-  tokenExpiry DateTime // when the access token expires
+  tokenExpiry DateTime
   scopes      String   @default("")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // A provider+email pair is unique so re-connecting updates the same row.
-  @@unique([provider, email])
+  // Unique per user (so two users can connect the same address independently).
+  @@unique([userId, provider, email])
+  @@index([userId])
 }
 
-// OAuth *client* credentials for a provider (the Client ID + Secret you create
-// in Google Cloud / Microsoft Entra). Stored here — encrypted at rest, just like
-// account tokens — so they live in the local database instead of a .env file.
-// One row per provider.
+// (Self-host only) per-provider OAuth client credentials entered in-app.
+// In the hosted deployment a single central client is configured via env vars
+// and this table is unused.
 model ProviderCredential {
   provider     String   @id // "google" | "microsoft"
   clientId     String // encrypted (AES-256-GCM)

@@ -47,6 +47,8 @@ export interface AccountPublic {
 
 /** Server-only: an account including its (decrypted) OAuth tokens. */
 export interface AccountWithTokens extends AccountPublic {
+  /** The owning user's id. Server-only — never sent to the browser. */
+  userId: string;
   accessToken: string;
   refreshToken: string | null;
   tokenExpiry: string; // ISO

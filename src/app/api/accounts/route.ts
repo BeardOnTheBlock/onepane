@@ -8,6 +8,7 @@ import {
   listAccountsPublic,
   updateAccountColor,
 } from "@/lib/accounts";
+import { requireUserId } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,8 +21,11 @@ function errorJson(message: string, status: number): Response {
 }
 
 export async function GET(): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   try {
-    const accounts = await listAccountsPublic();
+    const accounts = await listAccountsPublic(userId);
     return Response.json({ accounts });
   } catch (err) {
     return errorJson(messageOf(err), 500);
@@ -29,6 +33,9 @@ export async function GET(): Promise<Response> {
 }
 
 export async function PATCH(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   let body: unknown;
   try {
     body = await req.json();
@@ -49,7 +56,10 @@ export async function PATCH(req: Request): Promise<Response> {
   }
 
   try {
-    const account = await updateAccountColor(id, color);
+    const account = await updateAccountColor(userId, id, color);
+    if (!account) {
+      return errorJson("Account not found.", 404);
+    }
     return Response.json({ account });
   } catch (err) {
     return errorJson(messageOf(err), 500);
@@ -57,6 +67,9 @@ export async function PATCH(req: Request): Promise<Response> {
 }
 
 export async function DELETE(req: Request): Promise<Response> {
+  const userId = await requireUserId();
+  if (!userId) return Response.json({ error: "Not signed in." }, { status: 401 });
+
   const { searchParams } = new URL(req.url);
   const id = searchParams.get("id");
 
@@ -65,7 +78,7 @@ export async function DELETE(req: Request): Promise<Response> {
   }
 
   try {
-    await deleteAccount(id);
+    await deleteAccount(userId, id);
     return Response.json({ ok: true });
   } catch (err) {
     return errorJson(messageOf(err), 500);

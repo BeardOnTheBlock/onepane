@@ -14,6 +14,7 @@ import {
   OAUTH_STATE_COOKIE,
 } from "@/lib/config";
 import { buildAuthUrl } from "@/lib/oauth";
+import { requireUserId } from "@/lib/session";
 import type { OAuthProviderId } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -35,6 +36,13 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ provider: string }> },
 ): Promise<NextResponse> {
+  // A signed-in user is required: the resulting tokens are attached to them in
+  // the callback. Bounce browsers to the login page when there's no session.
+  const userId = await requireUserId();
+  if (!userId) {
+    return NextResponse.redirect(new URL("/login", req.url));
+  }
+
   const { provider } = await params;
 
   if (!isProviderId(provider)) {

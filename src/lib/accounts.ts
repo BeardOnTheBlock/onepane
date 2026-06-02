@@ -32,6 +32,7 @@ function rowToPublic(row: AccountRow): AccountPublic {
 function rowToWithTokens(row: AccountRow): AccountWithTokens {
   return {
     ...rowToPublic(row),
+    userId: row.userId,
     accessToken: decrypt(row.accessToken),
     refreshToken: row.refreshToken ? decrypt(row.refreshToken) : null,
     tokenExpiry: row.tokenExpiry.toISOString(),
@@ -39,36 +40,51 @@ function rowToWithTokens(row: AccountRow): AccountWithTokens {
   };
 }
 
-export async function listAccountsPublic(): Promise<AccountPublic[]> {
-  const rows = await prisma.account.findMany({ orderBy: { createdAt: "asc" } });
+export async function listAccountsPublic(
+  userId: string,
+): Promise<AccountPublic[]> {
+  const rows = await prisma.account.findMany({
+    where: { userId },
+    orderBy: { createdAt: "asc" },
+  });
   return rows.map(rowToPublic);
 }
 
-export async function listAccountsWithTokens(): Promise<AccountWithTokens[]> {
-  const rows = await prisma.account.findMany({ orderBy: { createdAt: "asc" } });
-  return rows.map(rowToWithTokens);
-}
-
-export async function getAccountWithTokens(
-  id: string,
-): Promise<AccountWithTokens | null> {
-  const row = await prisma.account.findUnique({ where: { id } });
-  return row ? rowToWithTokens(row) : null;
-}
-
-export async function getAccountsWithTokens(
-  ids: string[],
+export async function listAccountsWithTokens(
+  userId: string,
 ): Promise<AccountWithTokens[]> {
   const rows = await prisma.account.findMany({
-    where: { id: { in: ids } },
+    where: { userId },
     orderBy: { createdAt: "asc" },
   });
   return rows.map(rowToWithTokens);
 }
 
-/** Picks the next colour from the palette that is least used so far. */
-async function nextColor(): Promise<string> {
-  const rows = await prisma.account.findMany({ select: { color: true } });
+export async function getAccountWithTokens(
+  userId: string,
+  id: string,
+): Promise<AccountWithTokens | null> {
+  const row = await prisma.account.findFirst({ where: { id, userId } });
+  return row ? rowToWithTokens(row) : null;
+}
+
+export async function getAccountsWithTokens(
+  userId: string,
+  ids: string[],
+): Promise<AccountWithTokens[]> {
+  const rows = await prisma.account.findMany({
+    where: { id: { in: ids }, userId },
+    orderBy: { createdAt: "asc" },
+  });
+  return rows.map(rowToWithTokens);
+}
+
+/** Picks the next colour from the palette that is least used by this user. */
+async function nextColor(userId: string): Promise<string> {
+  const rows = await prisma.account.findMany({
+    where: { userId },
+    select: { color: true },
+  });
   const used = new Map<string, number>();
   for (const c of ACCOUNT_COLOR_PALETTE) used.set(c, 0);
   for (const r of rows) used.set(r.color, (used.get(r.color) ?? 0) + 1);
@@ -85,6 +101,7 @@ async function nextColor(): Promise<string> {
 }
 
 export interface UpsertAccountInput {
+  userId: string;
   provider: ProviderId;
   email: string;
   displayName: string | null;
@@ -105,7 +122,13 @@ export async function upsertAccount(
   input: UpsertAccountInput,
 ): Promise<AccountPublic> {
   const existing = await prisma.account.findUnique({
-    where: { provider_email: { provider: input.provider, email: input.email } },
+    where: {
+      userId_provider_email: {
+        userId: input.userId,
+        provider: input.provider,
+        email: input.email,
+      },
+    },
   });
 
   const encryptedAccess = encrypt(input.accessToken);
@@ -115,13 +138,18 @@ export async function upsertAccount(
 
   const row = await prisma.account.upsert({
     where: {
-      provider_email: { provider: input.provider, email: input.email },
+      userId_provider_email: {
+        userId: input.userId,
+        provider: input.provider,
+        email: input.email,
+      },
     },
     create: {
+      userId: input.userId,
       provider: input.provider,
       email: input.email,
       displayName: input.displayName,
-      color: await nextColor(),
+      color: await nextColor(input.userId),
       canTeams: input.canTeams,
       canMeet: input.canMeet,
       accessToken: encryptedAccess,
@@ -143,8 +171,10 @@ export async function upsertAccount(
   return rowToPublic(row);
 }
 
-/** Persists refreshed tokens for an account (used by the OAuth refresh flow). */
+/** Persists refreshed tokens for an account (used by the OAuth refresh flow).
+ *  Scoped by userId so a refresh can never touch another user's row. */
 export async function updateAccountTokens(
+  userId: string,
   id: string,
   tokens: {
     accessToken: string;
@@ -152,8 +182,8 @@ export async function updateAccountTokens(
     tokenExpiry: Date;
   },
 ): Promise<void> {
-  await prisma.account.update({
-    where: { id },
+  await prisma.account.updateMany({
+    where: { id, userId },
     data: {
       accessToken: encrypt(tokens.accessToken),
       ...(tokens.refreshToken
@@ -165,13 +195,19 @@ export async function updateAccountTokens(
 }
 
 export async function updateAccountColor(
+  userId: string,
   id: string,
   color: string,
-): Promise<AccountPublic> {
-  const row = await prisma.account.update({ where: { id }, data: { color } });
-  return rowToPublic(row);
+): Promise<AccountPublic | null> {
+  const result = await prisma.account.updateMany({
+    where: { id, userId },
+    data: { color },
+  });
+  if (result.count === 0) return null;
+  const row = await prisma.account.findFirst({ where: { id, userId } });
+  return row ? rowToPublic(row) : null;
 }
 
-export async function deleteAccount(id: string): Promise<void> {
-  await prisma.account.delete({ where: { id } });
+export async function deleteAccount(userId: string, id: string): Promise<void> {
+  await prisma.account.deleteMany({ where: { id, userId } });
 }
