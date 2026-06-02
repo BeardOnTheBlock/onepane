@@ -4,7 +4,27 @@
 // the provider implementations, the API routes, and the UI. Keep them stable.
 // ============================================================================
 
-export type ProviderId = "google" | "microsoft";
+/** Providers that authenticate via OAuth (consent + tokens). */
+export type OAuthProviderId = "google" | "microsoft";
+
+/** Every connectable provider. "imap" = a generic IMAP/SMTP mailbox + optional
+ *  CalDAV calendar, authenticated with a username + (app) password rather than OAuth. */
+export type ProviderId = OAuthProviderId | "imap";
+
+/** Connection details for a generic IMAP/SMTP (+ optional CalDAV) account.
+ *  Stored as an encrypted JSON blob in the account's token field (no schema change). */
+export interface ImapCredentials {
+  imapHost: string;
+  imapPort: number;
+  imapSecure: boolean; // implicit TLS (usually port 993)
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean; // implicit TLS (usually port 465; false = STARTTLS on 587)
+  username: string;
+  password: string;
+  /** Optional CalDAV base URL (e.g. https://caldav.icloud.com). */
+  caldavUrl?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Accounts

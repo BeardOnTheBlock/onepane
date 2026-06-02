@@ -8,7 +8,7 @@ import {
   hasStoredCredential,
   maskClientId,
 } from "@/lib/provider-credentials";
-import type { ProviderId } from "@/lib/types";
+import type { OAuthProviderId } from "@/lib/types";
 
 export const APP_URL = process.env.APP_URL ?? "http://localhost:6969";
 
@@ -38,7 +38,7 @@ export const MICROSOFT_SCOPES = [
 ];
 
 export interface ProviderConfig {
-  id: ProviderId;
+  id: OAuthProviderId;
   label: string;
   clientId: string;
   clientSecret: string;
@@ -50,19 +50,19 @@ export interface ProviderConfig {
 
 const MICROSOFT_TENANT = process.env.MICROSOFT_TENANT ?? "common";
 
-export function redirectUriFor(provider: ProviderId): string {
+export function redirectUriFor(provider: OAuthProviderId): string {
   return `${APP_URL}/api/connect/${provider}/callback`;
 }
 
 /** The env var names that hold a provider's client credentials, if used. */
-function envVarsFor(provider: ProviderId): { id: string; secret: string } {
+function envVarsFor(provider: OAuthProviderId): { id: string; secret: string } {
   return provider === "google"
     ? { id: "GOOGLE_CLIENT_ID", secret: "GOOGLE_CLIENT_SECRET" }
     : { id: "MICROSOFT_CLIENT_ID", secret: "MICROSOFT_CLIENT_SECRET" };
 }
 
 /** Static (non-secret) parts of a provider's OAuth config. */
-function providerShape(provider: ProviderId) {
+function providerShape(provider: OAuthProviderId) {
   if (provider === "google") {
     return {
       id: "google" as const,
@@ -89,7 +89,7 @@ function providerShape(provider: ProviderId) {
  * Throws if neither source has credentials.
  */
 export async function getProviderConfig(
-  provider: ProviderId,
+  provider: OAuthProviderId,
 ): Promise<ProviderConfig> {
   const stored = await getStoredCredential(provider);
   const env = envVarsFor(provider);
@@ -108,7 +108,7 @@ export async function getProviderConfig(
 
 /** True when a provider has client credentials available (DB or env). */
 export async function isProviderConfigured(
-  provider: ProviderId,
+  provider: OAuthProviderId,
 ): Promise<boolean> {
   if (await hasStoredCredential(provider)) return true;
   const env = envVarsFor(provider);
@@ -130,7 +130,7 @@ export interface ProviderCredentialStatus {
 
 /** Reports a provider's credential status for the Settings UI (never leaks the secret). */
 export async function getProviderCredentialStatus(
-  provider: ProviderId,
+  provider: OAuthProviderId,
 ): Promise<ProviderCredentialStatus> {
   const redirectUri = redirectUriFor(provider);
   const stored = await getStoredCredential(provider);
@@ -156,7 +156,7 @@ export async function getProviderCredentialStatus(
   return { configured: false, source: null, clientIdHint: null, redirectUri, editable: true };
 }
 
-export const ALL_PROVIDERS: ProviderId[] = ["google", "microsoft"];
+export const ALL_PROVIDERS: OAuthProviderId[] = ["google", "microsoft"];
 
 /** Name of the httpOnly cookie holding the anti-CSRF OAuth state. */
 export const OAUTH_STATE_COOKIE = "onepane_oauth_state";

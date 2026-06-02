@@ -22,6 +22,7 @@ import type { AccountPublic } from "@/lib/types";
 const PROVIDER_LABEL: Record<AccountPublic["provider"], string> = {
   google: "Google",
   microsoft: "Microsoft",
+  imap: "IMAP",
 };
 
 /** Safely formats an ISO timestamp, tolerating bad input. */

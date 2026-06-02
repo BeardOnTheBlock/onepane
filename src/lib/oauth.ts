@@ -7,7 +7,7 @@
 
 import { getProviderConfig } from "@/lib/config";
 import { updateAccountTokens } from "@/lib/accounts";
-import type { AccountWithTokens, ProviderId } from "@/lib/types";
+import type { AccountWithTokens, OAuthProviderId } from "@/lib/types";
 
 // Refresh a little before the real expiry to avoid edge-of-expiry failures.
 const EXPIRY_SKEW_MS = 60_000;
@@ -37,7 +37,7 @@ export interface ConnectedProfile {
 
 /** Builds the provider consent URL the user is redirected to. */
 export async function buildAuthUrl(
-  provider: ProviderId,
+  provider: OAuthProviderId,
   state: string,
 ): Promise<string> {
   const cfg = await getProviderConfig(provider);
@@ -65,7 +65,7 @@ export async function buildAuthUrl(
 
 /** Exchanges an authorization code for access + refresh tokens. */
 export async function exchangeCodeForTokens(
-  provider: ProviderId,
+  provider: OAuthProviderId,
   code: string,
 ): Promise<ExchangedTokens> {
   const cfg = await getProviderConfig(provider);
@@ -104,7 +104,7 @@ export async function exchangeCodeForTokens(
  *   host Teams meetings. We detect this from the Graph organization endpoint.
  */
 export async function fetchProfile(
-  provider: ProviderId,
+  provider: OAuthProviderId,
   accessToken: string,
 ): Promise<ConnectedProfile> {
   if (provider === "google") {
@@ -166,7 +166,7 @@ export async function fetchProfile(
 
 /** Refreshes an access token using the stored refresh token. */
 async function refreshAccessToken(
-  provider: ProviderId,
+  provider: OAuthProviderId,
   refreshToken: string,
 ): Promise<ExchangedTokens> {
   const cfg = await getProviderConfig(provider);
@@ -208,6 +208,12 @@ async function refreshAccessToken(
 export async function getValidAccessToken(
   account: AccountWithTokens,
 ): Promise<string> {
+  // IMAP/CalDAV accounts store connection credentials (a JSON blob) in the token
+  // field — there is no OAuth token to refresh. Hand the blob straight back.
+  if (account.provider === "imap") {
+    return account.accessToken;
+  }
+
   const expiresAt = new Date(account.tokenExpiry).getTime();
   if (expiresAt - EXPIRY_SKEW_MS > Date.now()) {
     return account.accessToken;

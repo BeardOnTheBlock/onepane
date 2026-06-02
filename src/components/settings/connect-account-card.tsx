@@ -16,7 +16,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { FetchError, del } from "@/lib/fetcher";
 import { cn } from "@/lib/utils";
-import type { OkResponse, ProviderId } from "@/lib/types";
+import type { OkResponse, OAuthProviderId } from "@/lib/types";
 import type { ProviderCredentialStatus } from "@/hooks/use-provider-credentials";
 
 interface ProviderMeta {
@@ -25,7 +25,7 @@ interface ProviderMeta {
   accent: string;
 }
 
-const PROVIDER_META: Record<ProviderId, ProviderMeta> = {
+const PROVIDER_META: Record<OAuthProviderId, ProviderMeta> = {
   google: {
     label: "Google",
     blurb: "Gmail, Google Calendar, and Google Meet.",
@@ -58,7 +58,7 @@ function ProviderMark({ accent }: { accent: string }) {
 }
 
 export interface ConnectAccountCardProps {
-  provider: ProviderId;
+  provider: OAuthProviderId;
   /** Credential status for this provider (from useProviderCredentials). */
   status: ProviderCredentialStatus | undefined;
   isLoading?: boolean;
