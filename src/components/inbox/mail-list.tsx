@@ -9,8 +9,9 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { accountById } from "@/hooks/use-accounts";
 import { cn } from "@/lib/utils";
-import type { AccountPublic } from "@/lib/types";
+import type { AccountPublic, MailActionType } from "@/lib/types";
 import type { Conversation } from "@/components/inbox/conversations";
+import type { ActionTarget } from "@/hooks/use-mail-actions";
 
 export interface MailListProps {
   conversations: Conversation[];
@@ -21,6 +22,8 @@ export interface MailListProps {
   /** The active search term, used for the header label and empty-state copy. */
   query: string;
   onSelect: (conversation: Conversation) => void;
+  /** Apply a triage action to a target set of messages. */
+  onAction: (target: ActionTarget, action: MailActionType) => void;
 }
 
 /** A single placeholder row shown while messages load. */
@@ -61,6 +64,7 @@ export function MailList({
   selectedKey,
   query,
   onSelect,
+  onAction,
 }: MailListProps) {
   const searching = query.trim().length > 0;
 
@@ -107,6 +111,7 @@ export function MailList({
                 account={accountById(accounts, conversation.accountId)}
                 selected={selectedKey === conversation.key}
                 onSelect={onSelect}
+                onAction={onAction}
               />
             </li>
           ))}

@@ -25,6 +25,10 @@ import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAccounts } from "@/hooks/use-accounts";
+import {
+  useMailActions,
+  type ActionTarget,
+} from "@/hooks/use-mail-actions";
 import { fetcher } from "@/lib/fetcher";
 import { cn } from "@/lib/utils";
 import type { AccountError, MailListResponse, UnifiedMessage } from "@/lib/types";
@@ -123,6 +127,20 @@ export default function InboxPage() {
     ? `${selected.accountId}:${selected.threadId ?? selected.messageId}`
     : null;
 
+  // Clear the reader selection when its conversation gets trashed/archived.
+  const handleRemoved = React.useCallback((target: ActionTarget) => {
+    setSelected((prev) => {
+      if (!prev || prev.accountId !== target.accountId) return prev;
+      const ids = new Set(target.messageIds);
+      return ids.has(prev.messageId) ? null : prev;
+    });
+  }, []);
+
+  const { applyAction } = useMailActions({
+    mutate,
+    onRemoved: handleRemoved,
+  });
+
   const handleSelect = React.useCallback((conversation: Conversation) => {
     setSelected({
       accountId: conversation.accountId,
@@ -218,6 +236,7 @@ export default function InboxPage() {
             selectedKey={selectedKey}
             query={debouncedQuery}
             onSelect={handleSelect}
+            onAction={applyAction}
           />
         </section>
 
@@ -247,6 +266,7 @@ export default function InboxPage() {
               selected={selected}
               accounts={accounts}
               onReply={handleReply}
+              onAction={applyAction}
             />
           </div>
         </section>

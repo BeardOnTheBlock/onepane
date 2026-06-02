@@ -20,6 +20,7 @@ import type {
   DownloadedAttachment,
   EventAttendee,
   EventDraft,
+  MailActionType,
   MailAddress,
   MailDraft,
   MailProvider,
@@ -445,6 +446,69 @@ export const microsoftMailProvider: MailProvider = {
       mimeType: a.contentType || "application/octet-stream",
       contentBase64: a.contentBytes ?? "",
     };
+  },
+
+  async applyAction(
+    account: AccountWithTokens,
+    messageIds: string[],
+    action: MailActionType,
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    // POST /messages/{id}/move with the given destination folder for each id.
+    // The endpoint returns the moved message JSON, which we ignore.
+    const moveAll = (destinationId: string): Promise<unknown> =>
+      Promise.all(
+        messageIds.map((id) =>
+          gfetch(
+            `${GRAPH_BASE}/me/messages/${encodeURIComponent(id)}/move`,
+            account.accessToken,
+            { method: "POST", body: JSON.stringify({ destinationId }) },
+          ),
+        ),
+      );
+
+    // PATCH /messages/{id} with the given partial body for each id. The
+    // endpoint returns the updated message JSON, which we ignore.
+    const patchAll = (body: Record<string, unknown>): Promise<unknown> =>
+      Promise.all(
+        messageIds.map((id) =>
+          gfetch(
+            `${GRAPH_BASE}/me/messages/${encodeURIComponent(id)}`,
+            account.accessToken,
+            { method: "PATCH", body: JSON.stringify(body) },
+          ),
+        ),
+      );
+
+    switch (action) {
+      case "trash":
+        await moveAll("deleteditems");
+        return;
+      case "untrash":
+        await moveAll("inbox");
+        return;
+      case "archive":
+        await moveAll("archive");
+        return;
+      case "markRead":
+        await patchAll({ isRead: true });
+        return;
+      case "markUnread":
+        await patchAll({ isRead: false });
+        return;
+      case "star":
+        await patchAll({ flag: { flagStatus: "flagged" } });
+        return;
+      case "unstar":
+        await patchAll({ flag: { flagStatus: "notFlagged" } });
+        return;
+      default: {
+        // Exhaustiveness: if a new MailActionType is added, this errors at compile time.
+        const exhaustive: never = action;
+        throw new Error(`Unsupported mail action: ${String(exhaustive)}`);
+      }
+    }
   },
 
   async sendMessage(
